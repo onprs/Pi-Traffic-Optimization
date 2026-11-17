@@ -94,7 +94,11 @@ npm 包只包含 `src/`、`config.example.json`、`CHANGELOG.md`、`README.md` �
 
 npm 的 trusted publishing（OIDC）只能为已存在的包配置，因此首个版本使用 token 发布，之后切换到 OIDC：
 
-1. 首次发布：onprs 在 npmjs.com 创建对 `pi-traffic-optimization` 有发布权限、短有效期的 Granular Access Token，执行 `gh secret set NPM_TOKEN --repo onprs/Pi-Traffic-Optimization` 写入仓库 secret，然后按上节步骤推送 tag。
+1. 首次发布：onprs 在 npmjs.com 创建 Granular Access Token：
+   - 对 `pi-traffic-optimization`（或全部包）有读写权限，短有效期。
+   - 必须勾选 Bypass two-factor authentication，否则 CI 中 `npm publish` 返回 `EOTP`。npm 计划 2027 年 1 月取消此类 token 的直接发布能力，届时新包首发改用 `npm stage publish` 加网页 2FA 批准。
+
+   然后执行 `gh secret set NPM_TOKEN --repo onprs/Pi-Traffic-Optimization` 写入仓库 secret，按上节步骤推送 tag。
 2. 首次发布成功后，在 npmjs.com 包设置的 Trusted Publisher 中添加 GitHub Actions：
    - 用户 `onprs`。
    - 仓库 `Pi-Traffic-Optimization`。
@@ -118,16 +122,11 @@ AI 代理遇到以下操作时，先说明操作内容和影响，取得 onprs �
 
 本节只适用于 onprs 的维护设备。
 
-- 迁移到 npm 包之前，维护设备从 `~/.pi/agent/extensions/traffic-optimization/` 加载一份源码副本。该目录内的 `archive`、`reports` 是指向 `~/.pi/agent/backups/traffic-optimization/` 的符号链接。
-- 改用 npm 包后，默认数据目录变为 `~/.pi/agent/traffic-optimization/`，迁移步骤：
-  1. 退出全部 Pi 进程。
-  2. 备份 `~/.pi/agent/backups/traffic-optimization/`。
-  3. 迁移数据，二选一：
-     - 把其中的 `archive/`、`reports/` 和原 `config.json` 移到 `~/.pi/agent/traffic-optimization/`。
-     - 用 `PI_TRAFFIC_OPT_CONFIG_PATH`、`PI_TRAFFIC_OPT_ARCHIVE_DIR` 指向原位置。
-  4. 移除 `~/.pi/agent/extensions/traffic-optimization/`。
-  5. 执行 `pi install npm:pi-traffic-optimization`。
-
-  旧副本与 npm 包不能同时加载。
+- Ubuntu 维护设备已于 2026-11-17 迁移到 npm 包，当前状态：
+  - `settings.json` 的 `packages` 含 `npm:pi-traffic-optimization`，数据在 `~/.pi/agent/traffic-optimization/`（`config.json`、`archive/`、`reports/`）。
+  - 旧源码副本保存在 `~/.pi/agent/backups/traffic-optimization/legacy-extension/`。
+  - 迁移时仍有 Pi 进程加载着旧副本，为此保留了兼容路径：`~/.pi/agent/extensions/traffic-optimization/` 只剩 `archive`、`reports` 符号链接和旧 `config.json`，`~/.pi/agent/backups/traffic-optimization/archive`、`reports` 是指向新数据目录的符号链接。全部 Pi 进程重启或 `/reload` 后可删除这些兼容路径。
+- pi-sync 会同步 `extensions/` 与 `settings.json`，其他设备（包括 Windows）会随之移除旧副本代码并安装 npm 包；各设备旧副本目录中的真实归档数据需要手动移到该设备的 `~/.pi/agent/traffic-optimization/`，移动前退出该设备的全部 Pi 进程。
+- 开发时用 `pi -e <仓库路径>` 试用本地源码前，先在 `pi config` 中停用 npm 包，或使用临时 `PI_CODING_AGENT_DIR`。
 - 仓库根目录下的 `archive`、`reports` 符号链接和 `.maintenance-backup/` 是本机遗留物，已被 `.gitignore` 忽略，不随仓库或包发布。
 - 维护环境的现场验证只证明该环境的行为；对外描述兼容性以 CI 结果和 `package.json` 声明为准。
