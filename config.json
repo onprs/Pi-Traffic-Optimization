@@ -1,0 +1,85 @@
+{
+  "enabled": true,
+  "skipBelowKB": 300,
+  "maxLongEdge": 1920,
+  "targetKB": 375,
+  "maxQuality": 88,
+  "defaultQuality": 82,
+  "minQuality": 60,
+  "preserveAlpha": true,
+  "cache": {
+    "enabled": true,
+    "maxSizeMB": 1024,
+    "maxAgeDays": 7
+  },
+  "logging": "off",
+  "contextOptimization": {
+    "enabled": true,
+    "archiveToolResults": true,
+    "projection": true,
+    "recall": true,
+    "historySearch": true,
+    "llmCompactFallback": true,
+    "minimumToolResultBytes": 4096,
+    "oversizedToolResultBytes": 32768,
+    "keepRecentTurns": 4,
+    "keepRecentTokens": 12000,
+    "hotLeaseTurns": 4,
+    "hotLeaseSeconds": 120,
+    "fallbackCooldownSeconds": 300,
+    "reuseLeaseBonusTurns": 2,
+    "maxLeaseTurns": 20,
+    "stateLimit": 12,
+    "thresholds": {
+      "low": 0.6,
+      "medium": 0.75,
+      "high": 0.9,
+      "emergency": 0.95,
+      "target": 0.6,
+      "aggressiveTarget": 0.4
+    },
+    "gc": {
+      "lowPressureMinReclaimTokens": 65536,
+      "lowPressureMinReclaimShare": 0.45,
+      "lowMediumMinBatchTokens": 49152,
+      "lowMediumMinBatchShare": 0.25,
+      "minBatchTokens": 32768,
+      "minBatchShare": 0.12,
+      "highPressureMinBatchTokens": 16384,
+      "highPressureMinBatchShare": 0.04,
+      "emergencyMinBatchTokens": 4096,
+      "cooldownTurns": 8,
+      "minCacheableTokens": 8192
+    },
+    "archive": {
+      "maxSizeMB": 2048,
+      "retentionDays": 30,
+      "maxObjectMB": 32,
+      "maxFileHashMB": 64,
+      "maxMetadataArgumentBytes": 8192,
+      "maxSnapshotProofBytes": 1048576,
+      "maxSnapshotProofLines": 10000,
+      "maxIndexChars": 262144,
+      "maintenanceSeconds": 300
+    },
+    "recallOptions": {
+      "pageLines": 80,
+      "maxPageLines": 400,
+      "maxBytes": 16384,
+      "maxFullBytes": 65536,
+      "maxMatches": 20,
+      "maxAround": 60,
+      "maxImages": 4,
+      "maxImageMB": 16,
+      "searchLimit": 10,
+      "maxSearchLimit": 30
+    }
+  },
+  "reporting": {
+    "summaryIntervalSeconds": 30,
+    "retentionDays": 14,
+    "maxSizeMB": 256,
+    "maxRunMB": 32,
+    "recentRecords": 200
+  }
+}

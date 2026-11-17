@@ -1,0 +1,18 @@
+# 依赖安装目录
+node_modules/
+
+# 本地运行数据（与源码同级的运行时目录或符号链接）
+/archive
+/reports
+
+# 维护用的本地备份
+.maintenance-backup/
+
+# 本地环境变量文件
+.env
+.env.local
+
+# 编辑器与系统生成文件
+.DS_Store
+Thumbs.db
+*.log

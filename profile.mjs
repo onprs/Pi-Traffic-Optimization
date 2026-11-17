@@ -1,0 +1,305 @@
+import { createHash } from 'node:crypto';
+
+const bytes = (value) => Buffer.byteLength(value, 'utf8');
+const encodedStringBytes = (value) => bytes(JSON.stringify(value)) - 2;
+const dataUrl = /^data:(image\/[\w.+-]+);base64,([A-Za-z0-9+/=]+)$/s;
+const families = new Map([
+  ['openai-responses', 'responses'], ['azure-openai-responses', 'responses'], ['openai-codex-responses', 'responses'],
+  ['openai-completions', 'chat'], ['mistral-conversations', 'chat'], ['anthropic-messages', 'anthropic'],
+  ['google-generative-ai', 'google'], ['google-vertex', 'google'], ['bedrock-converse-stream', 'bedrock'],
+  ['pi-messages', 'pi'],
+]);
+
+export function isProviderPayload(api, payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  switch (families.get(api)) {
+    case 'responses': return typeof payload.input === 'string' || Array.isArray(payload.input);
+    case 'google': return Array.isArray(payload.contents);
+    case 'pi': return Array.isArray(payload.context?.messages);
+    case 'chat': case 'anthropic': case 'bedrock': return Array.isArray(payload.messages);
+    default: return false;
+  }
+}
+
+// 只匹配当前模型所属的推理入口；查询参数、凭据和其他 HTTP 请求不进入报告。
+export function matchesProviderEndpoint(model, input) {
+  if (!families.has(model.api)) return false;
+  const url = new URL(input);
+  if (!['http:', 'https:'].includes(url.protocol)) return false;
+  let base;
+  try { base = new URL(model.baseUrl); } catch { /* Vertex 的默认地址可能包含 {location}。 */ }
+  const path = url.pathname.replace(/\/+$/, '');
+  const root = base?.pathname.replace(/\/+$/, '') ?? '';
+  const sameOrigin = base?.origin === url.origin;
+  const googleDefault = model.api === 'google-vertex' && (!base || base.hostname.includes('{location}')) &&
+    /^(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com$/.test(url.hostname);
+  const bedrockDefault = model.api === 'bedrock-converse-stream' && base &&
+    /^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?$/.test(base.hostname) &&
+    /^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?$/.test(url.hostname);
+  if (!sameOrigin && !googleDefault && !bedrockDefault) return false;
+  switch (model.api) {
+    case 'openai-responses': return path === `${root}/responses`;
+    case 'azure-openai-responses': {
+      const azureHost = /\.(?:openai\.azure|cognitiveservices\.azure|ai\.azure)\.com$/.test(base.hostname);
+      const normalized = azureHost && ['', '/openai', '/openai/v1/responses'].includes(root) ? '/openai/v1' : root;
+      return path === `${normalized}/responses`;
+    }
+    case 'openai-codex-responses': {
+      const endpoint = /\/codex\/responses$/.test(root) ? root : /\/codex$/.test(root) ? `${root}/responses` : `${root}/codex/responses`;
+      return path === endpoint;
+    }
+    case 'openai-completions': return path === `${root}/chat/completions`;
+    case 'mistral-conversations': return path === `${root}/v1/chat/completions`;
+    case 'anthropic-messages': return path === `${root}/v1/messages`;
+    case 'pi-messages': return path === `${root}/messages`;
+    case 'google-generative-ai': case 'google-vertex':
+      return (googleDefault || path.startsWith(`${root}/`)) && /\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/.test(path);
+    case 'bedrock-converse-stream':
+      return path === `${root}/model/${encodeURIComponent(model.id)}/converse-stream`;
+    default: return false;
+  }
+}
+
+export function sourcesFromContext(messages) {
+  const sources = [];
+  const calls = new Map();
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      for (const block of message.content ?? []) {
+        if (block.type === 'toolCall') {
+          calls.set(block.id, block.name);
+          calls.set(block.id.split('|')[0], block.name);
+        }
+      }
+    }
+  }
+  for (const message of messages) {
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (const block of content) {
+      if (block.type !== 'image' || typeof block.data !== 'string') continue;
+      const source = message.role === 'toolResult'
+        ? message.toolName === 'read' ? 'toolResult/read image' : 'toolResult/other'
+        : message.role === 'user' ? 'user image' : 'unknown';
+      sources.push({ data: block.data, source, mime: block.mimeType });
+    }
+  }
+  return { sources, calls };
+}
+
+export function analyzePayload(api, payload, context = {}, seen = new Set(), hashCache = new Map(), rawJson) {
+  const serialized = rawJson ?? JSON.stringify(payload);
+  if (typeof serialized !== 'string') throw new Error('请求体无法序列化为 JSON');
+  const total = bytes(serialized);
+  const parts = {
+    system_bytes: 0, user_text_bytes: 0, assistant_text_bytes: 0,
+    tool_call_bytes: 0, tool_result_bytes: 0, image_payload_bytes: 0,
+    tool_schema_bytes: 0, other_bytes: 0,
+  };
+  const images = [];
+  const results = [];
+  const calls = new Map(context.calls ?? []);
+  let rawTextBytes = 0;
+  let opaqueReasoningBytes = 0;
+  let decodedTotal = 0;
+  const sourceImages = new Map();
+  for (const source of context.sources ?? []) {
+    const list = sourceImages.get(source.data) ?? [];
+    list.push(source); sourceImages.set(source.data, list);
+  }
+  const addText = (key, value) => {
+    if (typeof value !== 'string') return;
+    parts[key] += encodedStringBytes(value);
+    rawTextBytes += bytes(value);
+  };
+  const addJson = (key, value) => {
+    if (value !== undefined) parts[key] += bytes(JSON.stringify(value));
+  };
+  const addOpaque = (value) => {
+    if (typeof value === 'string') opaqueReasoningBytes += encodedStringBytes(value);
+  };
+  const addBase64 = (b64, mime, toolName) => {
+    if (typeof b64 !== 'string' || typeof mime !== 'string' || !mime.startsWith('image/') || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return;
+    let sha256 = hashCache.get(b64);
+    if (!sha256) {
+      sha256 = createHash('sha256').update(b64, 'base64').digest('hex');
+      if (b64.length <= 8 * 1024 * 1024) {
+        hashCache.set(b64, sha256);
+        let retained = 0;
+        for (const key of hashCache.keys()) retained += key.length;
+        while (retained > 24 * 1024 * 1024 || hashCache.size > 12) {
+          const oldest = hashCache.keys().next().value;
+          retained -= oldest.length;
+          hashCache.delete(oldest);
+        }
+      }
+    }
+    const decoded = Buffer.byteLength(b64, 'base64');
+    const source = sourceImages.get(b64)?.shift();
+    images.push({ image_hash: sha256, mime_type: mime, decoded_bytes: decoded,
+      base64_bytes: b64.length, image_payload_bytes: b64.length,
+      source_type: source?.source ?? 'unknown', repeated: seen.has(sha256), tool_name: toolName ?? '' });
+    decodedTotal += decoded;
+    parts.image_payload_bytes += b64.length;
+  };
+  const addImageUrl = (value, toolName) => {
+    const match = typeof value === 'string' && dataUrl.exec(value);
+    if (match) addBase64(match[2], match[1], toolName);
+  };
+  const call = (id, name, args) => {
+    if (id) calls.set(id, name);
+    if (typeof args === 'string') addText('tool_call_bytes', args);
+    else addJson('tool_call_bytes', args);
+  };
+  const result = (name, visit) => {
+    const oldText = parts.tool_result_bytes;
+    const oldImage = parts.image_payload_bytes;
+    visit(name);
+    results.push({ tool_name: name, text_bytes: parts.tool_result_bytes - oldText,
+      image_bytes: parts.image_payload_bytes - oldImage });
+  };
+  const textKeys = new Map([['system', 'system_bytes'], ['developer', 'system_bytes'], ['user', 'user_text_bytes'],
+    ['assistant', 'assistant_text_bytes'], ['model', 'assistant_text_bytes'], ['tool', 'tool_result_bytes'], ['toolResult', 'tool_result_bytes']]);
+  const textKey = (role) => textKeys.get(role);
+  const visitContent = (content, key, toolName) => {
+    if (!key) return;
+    if (typeof content === 'string') { addText(key, content); return; }
+    if (!Array.isArray(content)) return;
+    for (const item of content) {
+      if (!item) continue;
+      switch (item.type) {
+        case 'input_text': case 'output_text': case 'text': addText(key, item.text); break;
+        case 'input_image': addImageUrl(item.image_url, toolName); break;
+        case 'image_url': addImageUrl(typeof item.image_url === 'string' ? item.image_url : item.image_url?.url, toolName); break;
+        case 'image':
+          if (item.source?.type === 'base64') addBase64(item.source.data, item.source.media_type, toolName);
+          else if (families.get(api) === 'pi') addBase64(item.data, item.mimeType, toolName);
+          break;
+        case 'tool_use': call(item.id, item.name, item.input); break;
+        case 'toolCall': call(item.id, item.name, item.arguments); break;
+        case 'tool_result': {
+          const name = calls.get(item.tool_use_id) ?? 'unknown';
+          result(name, () => visitContent(item.content, 'tool_result_bytes', name));
+          break;
+        }
+        case 'thinking': addText(key, item.thinking); addOpaque(item.signature ?? item.thinkingSignature); break;
+        case 'redacted_thinking': addOpaque(item.data); break;
+      }
+    }
+  };
+  const visitGoogleParts = (content, key, toolName) => {
+    for (const item of content ?? []) {
+      addText(key, item.text);
+      addOpaque(item.thoughtSignature);
+      if (item.inlineData) addBase64(item.inlineData.data, item.inlineData.mimeType, toolName);
+      if (item.functionCall) call(item.functionCall.id, item.functionCall.name, item.functionCall.args);
+      if (item.functionResponse) {
+        const response = item.functionResponse;
+        const name = response.name ?? calls.get(response.id) ?? 'unknown';
+        result(name, () => {
+          addJson('tool_result_bytes', response.response);
+          visitGoogleParts(response.parts, 'tool_result_bytes', name);
+        });
+      }
+    }
+  };
+  const visitBedrock = (content, key, toolName) => {
+    for (const item of content ?? []) {
+      addText(key, item.text);
+      if (item.json !== undefined) addJson(key, item.json);
+      if (item.image) {
+        const format = item.image.format;
+        addBase64(item.image.source?.bytes, `image/${format === 'jpg' ? 'jpeg' : format}`, toolName);
+      }
+      if (item.toolUse) call(item.toolUse.toolUseId, item.toolUse.name, item.toolUse.input);
+      if (item.toolResult) {
+        const name = calls.get(item.toolResult.toolUseId) ?? 'unknown';
+        result(name, () => visitBedrock(item.toolResult.content, 'tool_result_bytes', name));
+      }
+      if (item.reasoningContent) {
+        addText(key, item.reasoningContent.reasoningText?.text);
+        addOpaque(item.reasoningContent.reasoningText?.signature);
+        addOpaque(item.reasoningContent.redactedContent);
+      }
+    }
+  };
+  switch (families.get(api)) {
+    case 'responses':
+      addText('system_bytes', payload.instructions);
+      if (typeof payload.input === 'string') addText('user_text_bytes', payload.input);
+      else for (const item of payload.input ?? []) {
+        if (textKey(item.role)) visitContent(item.content, textKey(item.role));
+        else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+          call(item.call_id, item.name, item.arguments);
+          addText('tool_call_bytes', item.input);
+        } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+          const name = calls.get(item.call_id) ?? 'unknown';
+          result(name, () => visitContent(item.output, 'tool_result_bytes', name));
+        } else if (item.type === 'reasoning') addOpaque(item.encrypted_content);
+      }
+      addJson('tool_schema_bytes', payload.tools);
+      break;
+    case 'chat':
+      for (const message of payload.messages ?? []) {
+        if (message.role === 'tool') {
+          const name = calls.get(message.tool_call_id) ?? message.name ?? 'unknown';
+          result(name, () => visitContent(message.content, 'tool_result_bytes', name));
+        } else {
+          visitContent(message.content, textKey(message.role));
+          if (message.role === 'assistant') {
+            addText('assistant_text_bytes', message.reasoning_content);
+            for (const item of message.tool_calls ?? []) call(item.id, item.function?.name, item.function?.arguments);
+          }
+        }
+      }
+      addJson('tool_schema_bytes', payload.tools);
+      break;
+    case 'anthropic':
+      visitContent(payload.system, 'system_bytes');
+      for (const message of payload.messages ?? []) visitContent(message.content, textKey(message.role));
+      addJson('tool_schema_bytes', payload.tools);
+      break;
+    case 'google':
+      visitGoogleParts(payload.systemInstruction?.parts, 'system_bytes');
+      for (const message of payload.contents ?? []) {
+        const key = textKey(message.role);
+        if (key) visitGoogleParts(message.parts, key);
+      }
+      addJson('tool_schema_bytes', payload.tools);
+      break;
+    case 'bedrock':
+      visitBedrock(payload.system, 'system_bytes');
+      for (const message of payload.messages ?? []) {
+        const key = textKey(message.role);
+        if (key) visitBedrock(message.content, key);
+      }
+      addJson('tool_schema_bytes', payload.toolConfig?.tools);
+      break;
+    case 'pi':
+      for (const message of payload.context?.messages ?? []) {
+        if (message.role === 'toolResult') {
+          result(message.toolName, () => visitContent(message.content, 'tool_result_bytes', message.toolName));
+        } else {
+          visitContent(message.content, textKey(message.role));
+          if (message.role === 'system') {
+            for (const section of Object.values(message.sections ?? {})) addText('system_bytes', section);
+            addJson('tool_schema_bytes', message.toolsAdded);
+          }
+        }
+      }
+      break;
+  }
+  const categorized = Object.values(parts).reduce((a, b) => a + b, 0);
+  parts.other_bytes = total - categorized;
+  if (parts.other_bytes < 0) throw new Error('分类字节总量超过请求体大小');
+  for (const image of images) seen.add(image.image_hash);
+  return { total_payload_bytes: total, ...parts, image_count: images.length,
+    image_decoded_bytes: decodedTotal, text_content_utf8_bytes: rawTextBytes,
+    opaque_reasoning_bytes: opaqueReasoningBytes, images, results };
+}
+
+export const analyzeResponsesPayload = (...args) => analyzePayload('openai-responses', ...args);
+export const mib = (n) => (n / 1048576).toFixed(3);
+export const csv = (cells) => cells.map((cell) => {
+  const str = String(cell ?? '');
+  return /[",\r\n]/.test(str) ? `"${str.replaceAll('"', '""')}"` : str;
+}).join(',');
