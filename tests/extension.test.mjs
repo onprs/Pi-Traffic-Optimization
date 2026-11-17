@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
-import register from '../index.ts';
+import register from '../src/index.ts';
 
 const endpoint = 'https://example.test/v1/responses';
 const asMiB = (bytes) => `${(bytes / 1048576).toFixed(3)} MiB`;
@@ -168,6 +168,31 @@ test('统一开关、补全、图片优化和实际请求统计在同一扩展�
     assert.equal(globalThis.fetch, originalFetch);
     assert.match(restarted.statuses.at(-1), /^累计上传 0.000 MiB \| 当前 0.000 MiB \| 图片压缩率 0.0%$/);
     await restarted.emit('session_shutdown');
+  } finally {
+    globalThis.fetch = priorFetch;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('未指定路径时配置写入 Pi 配置目录，包目录保持只读', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-agent-'));
+  const keys = ['PI_CODING_AGENT_DIR', 'PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR', 'PI_TRAFFIC_OPT_ARCHIVE_DIR'];
+  const previousEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const priorFetch = globalThis.fetch;
+  for (const key of keys) delete process.env[key];
+  process.env.PI_CODING_AGENT_DIR = join(dir, 'agent');
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  try {
+    const app = await harness();
+    await app.command.handler('关', app.ctx);
+    const config = JSON.parse(await readFile(join(dir, 'agent', 'traffic-optimization', 'config.json'), 'utf8'));
+    assert.equal(config.enabled, false);
+    assert.equal(existsSync(new URL('../src/config.json', import.meta.url)), false);
+    await app.emit('session_shutdown');
   } finally {
     globalThis.fetch = priorFetch;
     for (const [key, value] of Object.entries(previousEnv)) {

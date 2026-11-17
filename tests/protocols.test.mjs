@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { analyzePayload, isProviderPayload, matchesProviderEndpoint, sourcesFromContext } from '../profile.mjs';
+import { analyzePayload, isProviderPayload, matchesProviderEndpoint, sourcesFromContext } from '../src/profile.mjs';
 
 const data = Buffer.from('协议图片').toString('base64');
 const imageUrl = `data:image/png;base64,${data}`;

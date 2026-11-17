@@ -4,9 +4,9 @@ import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import sharp from 'sharp';
-import { ImageOptimizer } from '../optimizer.mjs';
-import { normalizeConfiguration } from '../configuration.mjs';
-import { ContextMemory } from '../context-memory.mjs';
+import { ImageOptimizer } from '../src/optimizer.mjs';
+import { normalizeConfiguration } from '../src/configuration.mjs';
+import { ContextMemory } from '../src/context-memory.mjs';
 
 const system = { role: 'system', content: '测试指令', timestamp: 1 };
 const assistant = (id, name = 'bash', arguments_ = {}) => ({ role: 'assistant', timestamp: 2,

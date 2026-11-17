@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -23,14 +23,16 @@ export default async function (pi: ExtensionAPI) {
     try { return normalizeConfiguration(JSON.parse(readFileSync(path, 'utf8'))); }
     catch { return normalizeConfiguration(); }
   };
-  const configPath = process.env.PI_TRAFFIC_OPT_CONFIG_PATH ?? join(import.meta.dirname, 'config.json');
+  // 用户数据放在 Pi 配置目录，避免 npm 包更新时覆盖配置、归档和报告。
+  const dataDir = join(getAgentDir(), 'traffic-optimization');
+  const configPath = process.env.PI_TRAFFIC_OPT_CONFIG_PATH ?? join(dataDir, 'config.json');
   const cacheDir = process.env.PI_TRAFFIC_OPT_CACHE_DIR;
   const optimizer = new ImageOptimizer(cacheDir ? { cacheDir } : {});
   let enabled = readConfig(configPath).enabled;
   const directory = process.env.PI_TRAFFIC_OPT_REPORT_DIR ??
-    join(import.meta.dirname, 'reports', `${new Date().toISOString().replaceAll(':', '-')}-${process.pid}`);
+    join(dataDir, 'reports', `${new Date().toISOString().replaceAll(':', '-')}-${process.pid}`);
   const memory = new ContextMemory({
-    directory: process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR ?? join(import.meta.dirname, 'archive'),
+    directory: process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR ?? join(dataDir, 'archive'),
     config: readConfig(configPath), optimizer,
   });
   const reporter = new TrafficReporter(directory, readConfig(configPath).reporting, () => memory.stats());

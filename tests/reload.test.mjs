@@ -1,18 +1,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { piRoot } from './pi-root.mjs';
 
 // 同一进程加载真实扩展，修改隔离副本中的实现后再次调用 Pi 加载器。
 test('Pi reload 刷新真实 ContextMemory 和它依赖的 ContextArchive，源码未变时重复 reload 正常', async () => {
-  const root = process.env.PI_TRAFFIC_OPT_PI_ROOT ?? (process.env.APPDATA
-    ? join(process.env.APPDATA, 'npm/node_modules/@earendil-works/pi-coding-agent')
-    : join(dirname(dirname(process.execPath)), 'lib/node_modules/@earendil-works/pi-coding-agent'));
+  const root = piRoot();
   const { loadExtensionsCached, clearExtensionCache } = await import(pathToFileURL(join(root, 'dist/core/extensions/loader.js')).href);
-  const source = resolve(import.meta.dirname, '..');
-  const directory = await mkdtemp(join(source, '.reload-test-'));
-  const files = ['index.ts', 'module-loader.mjs', 'optimizer.mjs', 'configuration.mjs', 'context-memory.mjs', 'archive.mjs', 'profile.mjs', 'transport.mjs', 'reporting.mjs', 'config.json'];
+  const repository = resolve(import.meta.dirname, '..');
+  const source = join(repository, 'src');
+  // 临时目录位于仓库内，保证副本可以解析仓库依赖。
+  const directory = await mkdtemp(join(repository, '.reload-test-'));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const pathKeys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_ARCHIVE_DIR', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR'];
+  const previousPaths = Object.fromEntries(pathKeys.map(key => [key, process.env[key]]));
+  for (const key of pathKeys) delete process.env[key];
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(directory, 'cache');
+  // 默认数据目录指向临时目录，避免读写真实 Pi 配置。
+  process.env.PI_CODING_AGENT_DIR = join(directory, 'agent');
+  const files = ['index.ts', 'module-loader.mjs', 'optimizer.mjs', 'configuration.mjs', 'context-memory.mjs', 'archive.mjs', 'profile.mjs', 'transport.mjs', 'reporting.mjs'];
   const notifications = [];
   const ctx = { hasUI: false, ui: { notify: text => notifications.push(text) } };
   const loaded = [];
@@ -54,6 +62,11 @@ test('Pi reload 刷新真实 ContextMemory 和它依赖的 ContextArchive，源�
     assert.equal((await third.tools.get('context_recall').definition.execute('reload-again', { workingState: true })).content[0].text, 'reloaded_context');
   } finally {
     for (const extension of loaded) await shutdown(extension);
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    for (const [key, value] of Object.entries(previousPaths)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
     await rm(directory, { recursive: true, force: true });
   }
 });

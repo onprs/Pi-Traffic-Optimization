@@ -9,7 +9,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { installedPi, fixtures } from './sdk-runner.mjs';
-import register from '../index.ts';
+import register from '../src/index.ts';
 
 const apis = ['openai-responses', 'azure-openai-responses', 'openai-codex-responses', 'openai-completions',
   'mistral-conversations', 'anthropic-messages', 'google-generative-ai', 'google-vertex', 'pi-messages', 'bedrock-converse-stream'];

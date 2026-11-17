@@ -1,17 +1,16 @@
 import { createServer } from 'node:http';
 import { mkdtemp, mkdir, writeFile, readFile, rm, readdir, stat } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import sharp from 'sharp';
-import register from '../index.ts';
+import register from '../src/index.ts';
+import { piRoot } from './pi-root.mjs';
 
 export async function installedPi() {
-  const root = process.env.PI_TRAFFIC_OPT_PI_ROOT ?? (process.env.APPDATA
-    ? join(process.env.APPDATA, 'npm/node_modules/@earendil-works/pi-coding-agent')
-    : join(dirname(dirname(process.execPath)), 'lib/node_modules/@earendil-works/pi-coding-agent'));
+  const root = piRoot();
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-  if (!pkg.version.startsWith('1.')) throw new Error('维护测试需要已安装 Pi 1.x；设置 PI_TRAFFIC_OPT_PI_ROOT');
+  if (!pkg.version.startsWith('1.')) throw new Error('SDK 测试需要 Pi 1.x；先执行 npm ci 或设置 PI_TRAFFIC_OPT_PI_ROOT');
   return { sdk: await import(pathToFileURL(join(root, 'dist/index.js')).href), version: pkg.version, root };
 }
 export async function fixtures(directory) {

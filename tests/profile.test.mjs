@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { analyzeResponsesPayload, sourcesFromContext } from '../profile.mjs';
+import { analyzeResponsesPayload, sourcesFromContext } from '../src/profile.mjs';
 
 const picture = Buffer.from('pi profiler synthetic image bytes');
 const base64 = picture.toString('base64');

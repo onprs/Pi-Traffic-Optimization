@@ -4,7 +4,7 @@ import { mkdtemp, readdir, rm, readFile, writeFile, mkdir, utimes } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
-import { ImageOptimizer, normalizeConfig, fingerprint } from '../optimizer.mjs';
+import { ImageOptimizer, normalizeConfig, fingerprint } from '../src/optimizer.mjs';
 
 const config = normalizeConfig({ skipBelowKB: 0, targetKB: 400 });
 const image = (buffer, mimeType = 'image/png') => ({ type: 'image', mimeType, data: buffer.toString('base64') });

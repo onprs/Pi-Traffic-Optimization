@@ -57,7 +57,7 @@ try {
   const raw=base.canonical.find(m=>m.toolName==='read').content[0].text;
   const placeholder=opt.requests.at(-1).payload.input.find(x=>x.type==='function_call_output'&&x.call_id==='call_1').output;
   const baseline=data(base),optimized=data(opt);
-  const sourceHashes = Object.fromEntries(await Promise.all(['index.ts','module-loader.mjs','optimizer.mjs','profile.mjs','transport.mjs','archive.mjs','context-memory.mjs','configuration.mjs','config.json','reporting.mjs','tests/sdk-runner.mjs','tests/benchmark.mjs'].map(async path => [path,createHash('sha256').update(await readFile(resolve(import.meta.dirname,'..',path))).digest('hex')])));
+  const sourceHashes = Object.fromEntries(await Promise.all(['src/index.ts','src/module-loader.mjs','src/optimizer.mjs','src/profile.mjs','src/transport.mjs','src/archive.mjs','src/context-memory.mjs','src/configuration.mjs','src/reporting.mjs','tests/sdk-runner.mjs','tests/benchmark.mjs'].map(async path => [path,createHash('sha256').update(await readFile(resolve(import.meta.dirname,'..',path))).digest('hex')])));
   const result={timestamp:new Date().toISOString(),sourceHashes,environment:{node:process.version,platform:process.platform,pi:base.version},
     measurement:'真实 Pi SDK + built-in tools + 本地 HTTP/SSE；请求字节 measured，provider usage 为字符/4 的 synthetic 值。未调用远程 LLM。',
     configuration:{...pairedConfig,hotLeaseTurns:4,hotLeaseSeconds:120},

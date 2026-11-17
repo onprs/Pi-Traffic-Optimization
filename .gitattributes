@@ -1,0 +1,6 @@
+# Windows 与 Ubuntu 共用 LF，避免换行差异进入提交和源码 hash。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.webp binary
+*.tgz binary

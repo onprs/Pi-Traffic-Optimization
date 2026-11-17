@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ContextArchive, hash } from '../archive.mjs';
-import { ContextMemory } from '../context-memory.mjs';
-import { normalizeConfiguration } from '../configuration.mjs';
-import { ImageOptimizer } from '../optimizer.mjs';
-import { TrafficReporter } from '../reporting.mjs';
+import { ContextArchive, hash } from '../src/archive.mjs';
+import { ContextMemory } from '../src/context-memory.mjs';
+import { normalizeConfiguration } from '../src/configuration.mjs';
+import { ImageOptimizer } from '../src/optimizer.mjs';
+import { TrafficReporter } from '../src/reporting.mjs';
 const config = normalizeConfiguration({ contextOptimization: { keepRecentTurns: 0, keepRecentTokens: 0,
   oversizedToolResultBytes: 1024, hotLeaseTurns: 3, hotLeaseSeconds: 1 } });
 const meta = (name, bytes) => ({ id: `ctx://tool/${hash(name)}`, kind: 'tool', sessionId: 'test',

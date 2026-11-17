@@ -4,7 +4,7 @@ import { createServer, request } from 'node:http';
 import { connect, createServer as createHttp2Server } from 'node:http2';
 import { once } from 'node:events';
 import { brotliCompressSync, deflateSync, gzipSync, zstdCompressSync } from 'node:zlib';
-import { observeRequests } from '../transport.mjs';
+import { observeRequests } from '../src/transport.mjs';
 
 const body = JSON.stringify({ model: 'test', messages: [{ role: 'user', content: '中文\n"正文"' }] });
 const listen = async server => { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return `http://127.0.0.1:${server.address().port}`; };

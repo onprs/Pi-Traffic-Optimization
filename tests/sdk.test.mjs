@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import register from '../index.ts';
+import register from '../src/index.ts';
 import { runSession, fixtures, installedPi } from './sdk-runner.mjs';
 
 test('Pi 1.x SDK 长会话：真实工具、精确 recall、stale、image page-in 与 canonical pairing', { timeout: 60000 }, async () => {
