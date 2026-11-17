@@ -1,8 +1,8 @@
-# 流量优化与上下文归档（开发维护环境）
+# 流量优化与上下文归档：技术参考（开发维护环境）
 
-本文件面向维护者本机的扩展目录。当前多协议接入在 Ubuntu、Node 24.22.1、Pi 1.5.0 上验证；原实现曾在 Windows、Node 24.18.0、Pi 1.0.1 上验证，新增协议尚未在 Windows 现场复测。SDK 测试读取本机安装的 Pi 1.x，默认在 Windows npm 全局目录或 Linux 当前 Node 安装前缀下查找，可用 `PI_TRAFFIC_OPT_PI_ROOT` 指定安装目录。公开安装说明需要另行按项目声明的系统要求编写。
+本文件是实现、配置与故障恢复的技术参考，面向开发维护环境；开发与发布流程见仓库根目录的 `AGENTS.md`，公开用法见 `README.md`。多协议接入曾在 Ubuntu、Node 24.22.1、Pi 1.5.0 上现场验证；原实现曾在 Windows、Node 24.18.0、Pi 1.0.1 上验证，新增协议尚未在 Windows 现场复测。SDK 测试优先使用 `npm ci` 安装的 devDependencies 中的 Pi，其次查找 Windows npm 全局目录或 Linux 当前 Node 安装前缀，可用 `PI_TRAFFIC_OPT_PI_ROOT` 指定安装目录。
 
-修改扩展或配置后，在 Pi 运行 `/reload` 或重启。入口在每次加载时计算本地实现文件的源码 hash，用同一版本的原生 ESM URL 加载整个依赖图，避免 reload 复用旧 MJS 实现；源码未变时保持模块版本稳定。升级归档实现前应退出使用同一归档目录的所有 Pi 进程并备份目录。本机原实现的备份在 `.maintenance-backup/context-v1/`。
+修改扩展或配置后，在 Pi 运行 `/reload` 或重启。入口在每次加载时计算 `src/` 内实现文件的源码 hash，用同一版本的原生 ESM URL 加载整个依赖图，避免 reload 复用旧 MJS 实现；源码未变时保持模块版本稳定。升级归档实现前应退出使用同一归档目录的所有 Pi 进程并备份目录。
 
 ## 数据流和边界
 
@@ -32,26 +32,28 @@ flowchart LR
 
 | 文件或目录 | 用途 |
 |---|---|
-| `index.ts` | Pi 1.x 事件、工具、命令、开关与请求观测接入 |
-| `module-loader.mjs` | 原生 ESM 加载桥，保留 URL 的源码版本参数 |
-| `optimizer.mjs` | 原图片处理、内存/磁盘缓存和失败回退 |
-| `context-memory.mjs` | provenance、snapshot、投影、lease、working state、recall |
-| `archive.mjs` | SQLite WAL、FTS5、内容寻址 blob、事务和 GC |
-| `configuration.mjs` | 配置默认值及边界校验 |
-| `profile.mjs` | 协议结构、推理端点匹配、正文分类与图片来源 |
-| `transport.mjs` | fetch、Node HTTP/1 与 HTTP/2 的最终正文及响应状态观测 |
-| `reporting.mjs` | 增量事件、CSV 和有界汇总报告 |
-| `archive/index.sqlite` | 对象、blob 引用、关系、usage、projection 和 FTS 索引 |
-| `archive/blobs/<sha256>.blob` | 工具内容、完整可用 stdout、参数、原图和优化图 |
-| `reports/<时间>-<pid>/` | 每次维护进程的流量记录 |
-| `reports/benchmarks/` | 本地 HTTP/SSE 对照、canonical session 和报告 |
+| `src/index.ts` | Pi 1.x 事件、工具、命令、开关与请求观测接入 |
+| `src/module-loader.mjs` | 原生 ESM 加载桥，保留 URL 的源码版本参数 |
+| `src/optimizer.mjs` | 原图片处理、内存/磁盘缓存和失败回退 |
+| `src/context-memory.mjs` | provenance、snapshot、投影、lease、working state、recall |
+| `src/archive.mjs` | SQLite WAL、FTS5、内容寻址 blob、事务和 GC |
+| `src/configuration.mjs` | 配置默认值及边界校验 |
+| `src/profile.mjs` | 协议结构、推理端点匹配、正文分类与图片来源 |
+| `src/transport.mjs` | fetch、Node HTTP/1 与 HTTP/2 的最终正文及响应状态观测 |
+| `src/reporting.mjs` | 增量事件、CSV 和有界汇总报告 |
+| `<数据目录>/archive/index.sqlite` | 对象、blob 引用、关系、usage、projection 和 FTS 索引 |
+| `<数据目录>/archive/blobs/<sha256>.blob` | 工具内容、完整可用 stdout、参数、原图和优化图 |
+| `<数据目录>/reports/<时间>-<pid>/` | 每个 Pi 进程的流量记录 |
+| `reports/benchmarks/`（仓库内，已忽略） | 本地 HTTP/SSE 对照、canonical session 和报告 |
+
+`<数据目录>` 默认为 Pi 配置目录下的 `traffic-optimization/`（`~/.pi/agent/traffic-optimization/`，`PI_CODING_AGENT_DIR` 可改变 Pi 配置目录）。数据不放在扩展包目录，npm 包更新不会覆盖配置、归档和报告。
 
 | 环境变量 | 默认位置或用途 |
 |---|---|
-| `PI_TRAFFIC_OPT_CONFIG_PATH` | 本扩展的 `config.json` |
-| `PI_TRAFFIC_OPT_ARCHIVE_DIR` | 本扩展的 `archive/` |
+| `PI_TRAFFIC_OPT_CONFIG_PATH` | `<数据目录>/config.json` |
+| `PI_TRAFFIC_OPT_ARCHIVE_DIR` | `<数据目录>/archive/` |
 | `PI_TRAFFIC_OPT_CACHE_DIR` | 系统临时目录下的 `pi-image-optimizer` |
-| `PI_TRAFFIC_OPT_REPORT_DIR` | 本扩展的 `reports/` |
+| `PI_TRAFFIC_OPT_REPORT_DIR` | 本次运行的报告目录，默认 `<数据目录>/reports/<时间>-<pid>/` |
 | `PI_TRAFFIC_OPT_PI_ROOT` | 维护 SDK 测试使用的 Pi 安装目录 |
 
 维护环境建议设置绝对路径。归档含原始代码、日志、参数和图片；报告也可能包含路径、命令及模型端点，分享时需要检查内容。
@@ -79,7 +81,7 @@ HTTP/2 观测依赖 Node 的 `http2.client.stream` diagnostics channels；缺少
 
 ## 配置
 
-所有默认值已显式写入 `config.json`。以下 KB/MB 容量按 1024 进制计算。
+配置文件不存在或字段缺失时使用 `src/configuration.mjs` 与 `src/optimizer.mjs` 中的默认值；`config.example.json` 列出全部字段，其中 `logging` 为 `off`，代码默认值为 `summary`。修改默认值时同步更新两处和本节表格。以下 KB/MB 容量按 1024 进制计算。
 
 图片参数保持原行为：低于 300 KiB 默认跳过，目标 375 KiB，最长边 1920，默认 quality 82、最低 60、最高 88，保留透明通道；收益不足 5% 使用原图。缓存默认 1024 MiB / 7 天，内存图片缓存为 64 MiB。图片处理或缓存失败时保留原图。原图指扩展收到的 image block，Pi 自身的图片预处理可能已经发生。归档保存原图和选定的优化版本，recall 优先复用已保存版本。
 
@@ -193,10 +195,11 @@ blob 经 SHA-256 校验、fsync 和原子 rename 后提交 metadata。写入和 
 
 ## 验证和报告
 
-在本扩展目录执行：
+在仓库根目录执行：
 
-```powershell
+```bash
 npm ci
+npm run check
 npm test
 npm run test:sdk
 npm run benchmark
@@ -219,6 +222,6 @@ npm run benchmark
 
 现场维护验证的结果只证明相应环境和工作负载。默认对照可验证上传量变化；本地 synthetic usage 的 compact 次数不能推广为真实远程模型的保证。
 
-当前 Ubuntu 维护环境的 59 项回归测试和 21 个文件语法检查通过，包含全部 10 种内置协议的真实 SDK 序列化及本地传输验证。reload 回归在隔离副本中修改真实 ContextMemory 及它依赖的 ContextArchive，确认再次加载取得两层新实现。
+回归测试包含全部 10 种内置协议的真实 SDK 序列化及本地传输验证。reload 回归在隔离副本中修改真实 ContextMemory 及它依赖的 ContextArchive，确认再次加载取得两层新实现。测试数量与平台结果以 CI 记录为准。
 
-早期单协议对照保留在 [context-v1 benchmark 报告](reports/benchmarks/context-v1-reload/report.md) 和 [当时的代码 hash 与详细数据](reports/benchmarks/context-v1-reload/benchmark.json)。该历史对照包含 22 次本地 HTTP 请求，最终 body 从 1,560,343 bytes 降至 230,999 bytes；数值仅对应当时的实现与工作负载。
+早期单协议对照保存在维护者本机报告目录的 `reports/benchmarks/context-v1-reload/`（`report.md` 与 `benchmark.json`，未纳入仓库）。该历史对照包含 22 次本地 HTTP 请求，最终 body 从 1,560,343 bytes 降至 230,999 bytes；数值仅对应当时的实现与工作负载。
