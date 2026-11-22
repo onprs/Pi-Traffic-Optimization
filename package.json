@@ -1,6 +1,6 @@
 {
   "name": "pi-traffic-optimization",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pi 扩展：图片压缩、工具结果上下文归档与按需取回、上传流量统计",
   "type": "module",
   "license": "MIT",

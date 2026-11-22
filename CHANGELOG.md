@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-22
+
 ### 新增
 
 - 适配 `pi-antigravity-bridge`（`antigravity-acp`）：支持 `session/prompt` 与宿主 MCP 工具结果回传的上传流量统计、内容分类、状态栏更新和本地报告生成。
