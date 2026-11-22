@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-22
+
 ### 新增
 
 - 新增模型级启用配置（`models`）及 `/traffic-opt model`、`/traffic-opt models` 命令与交互式选择器，支持按 `<provider>/<model>` 单独开启或关闭优化（默认全部模型启用）。
