@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 适配 `pi-antigravity-bridge`（`antigravity-acp`）：支持 `session/prompt` 与宿主 MCP 工具结果回传的上传流量统计、内容分类、状态栏更新和本地报告生成。
+- 支持归档与追踪 `pi-antigravity-bridge` 镜像工具（`agy_read`、`agy_edit`、`agy_write`、`agy_bash` 等），在 `agy_edit`/`agy_write` 修改文件后自动标记既有读取快照为过期。
+
+### 改进
+
+- 图片压缩率按单次请求实际发送的图片统计，适配有状态增量协议，避免重复计入未重发的历史图片。
+- 并发工具调用产生极小输入 token 分摊样本时自动忽略，保持上下文动态校准稳定。
+- 在 `context_recall` 未激活的模式下跳过上下文投影并清理过期的上下文压力估算。
+
 ## [1.0.0] - 2026-11-17
 
 ### 新增

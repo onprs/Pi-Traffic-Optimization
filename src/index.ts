@@ -16,7 +16,7 @@ export default async function (pi: ExtensionAPI) {
   for (const file of runtimeFiles) digest.update(file).update(readFileSync(join(import.meta.dirname, file)));
   const revision = digest.digest('hex');
   const [{ ImageOptimizer }, { normalizeConfiguration }, { ContextMemory }, , { TrafficReporter },
-    { analyzePayload, isProviderPayload, sourcesFromContext, mib }, { observeRequests }] = await Promise.all(runtimeFiles.map(file =>
+    { analyzePayload, isDirectPayloadApi, isProviderPayload, sourcesFromContext, mib }, { observeRequests }] = await Promise.all(runtimeFiles.map(file =>
       loadNativeModule(pathToFileURL(join(import.meta.dirname, file)).href + '?runtime=' + revision)));
   const toMiB = (value: number) => `${mib(value)} MiB`;
   const readConfig = (path: string) => {
@@ -46,7 +46,10 @@ export default async function (pi: ExtensionAPI) {
   const waiting: any[] = [];
   let context: ReturnType<typeof sourcesFromContext> | undefined;
   let imageStats: { originalBytes: number; optimizedBytes: number } | undefined;
+  let imageMetrics: Map<string, { originalBytes: number; optimizedBytes: number }> | undefined;
   let candidate: any;
+  let pendingDirectRecord: any;
+  let pendingAcpContinuation: any;
   let stopObservation: (() => void) | undefined;
 
   const updateStatus = (ui: { setStatus: (key: string, text: string | undefined) => void } | undefined) => {
@@ -62,7 +65,10 @@ export default async function (pi: ExtensionAPI) {
     if (!next) {
       context = undefined;
       imageStats = undefined;
+      imageMetrics = undefined;
       candidate = undefined;
+      pendingDirectRecord = undefined;
+      pendingAcpContinuation = undefined;
       waiting.length = 0;
     } else {
       installObservation();
@@ -71,45 +77,82 @@ export default async function (pi: ExtensionAPI) {
 
   const save = (record?: any) => reporter.changed(record);
 
+  const recordRequest = ({
+    request, endpoint, headers, body, wireBytes, transport,
+    initialStatus = null, initialContextTokens = null, enqueueWaiting = true,
+  }: any) => {
+    const started = performance.now();
+    const payload = JSON.parse(body);
+    if (!isProviderPayload(request.api, payload)) return;
+    const result = analyzePayload(request.api, payload, request.context, seen, hashes, body);
+    const record = {
+      timestamp: new Date().toISOString(), request_id: reporter.count + 1,
+      tool_bytes_projected: request.projectionStats?.toolBytesProjected ?? 0,
+      image_blocks_projected: request.projectionStats?.imageBlocksProjected ?? 0,
+      image_bytes_avoided: request.projectionStats?.imageBytesAvoided ?? 0,
+      projection_ms: request.projectionStats?.projectionMs ?? 0,
+      provider: request.provider, model: request.model, api: request.api,
+      endpoint, transport, context_tokens: initialContextTokens,
+      estimated_context_tokens: request.estimated_context_tokens,
+      candidate_payload_bytes: request.bytes,
+      text_bytes: result.user_text_bytes + result.assistant_text_bytes,
+      content_encoding: header(headers, 'content-encoding'),
+      content_length: header(headers, 'content-length') || null,
+      response_status: initialStatus, download_bytes: null, ...result,
+      json_payload_bytes: result.total_payload_bytes, total_payload_bytes: wireBytes,
+      profile_ms: Math.round((performance.now() - started) * 10) / 10,
+    };
+    reporter.add(record);
+    if (enqueueWaiting) {
+      waiting.length = 0;
+      waiting.push(record);
+    }
+    uploadedBytes += record.total_payload_bytes;
+    currentBytes = record.total_payload_bytes;
+    if (result.image_count > 0) {
+      if (request.imageMetrics?.size) {
+        for (const image of result.images) {
+          const matched = request.imageMetrics.get(image.image_hash);
+          originalImageBytes += matched?.originalBytes ?? image.decoded_bytes;
+          sentImageBytes += matched?.optimizedBytes ?? image.decoded_bytes;
+        }
+      } else {
+        originalImageBytes += request.imageStats?.originalBytes ?? 0;
+        sentImageBytes += request.imageStats?.optimizedBytes ?? 0;
+      }
+    }
+    save();
+    updateStatus(request.ui);
+    return record;
+  };
+
+  // 提取 antigravity-acp 活跃轮次中待通过宿主 MCP 回传的末尾工具结果（与桥接侧 agy_mcp_ 调用编号对齐）。
+  const extractAcpMcpToolResults = (messages: any[]) => {
+    const results: any[] = [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message?.role !== 'toolResult') break;
+      if (typeof message.toolCallId === 'string' && message.toolCallId.startsWith('agy_mcp_')) {
+        results.unshift({
+          toolCallId: message.toolCallId,
+          toolName: message.toolName,
+          isError: Boolean(message.isError),
+          content: (Array.isArray(message.content) ? message.content : []).map((block: any) =>
+            block?.type === 'image'
+              ? { type: 'image', data: block.data, mimeType: block.mimeType }
+              : { type: 'text', text: typeof block?.text === 'string' ? block.text : '' }),
+        });
+      }
+    }
+    return results;
+  };
+
   const installObservation = () => {
     if (stopObservation) return;
     stopObservation = observeRequests({
       getCandidate: () => enabled ? candidate : undefined,
-      onRequest: ({ candidate: request, endpoint, headers, body, wireBytes, transport }: any) => {
-        const started = performance.now();
-        const payload = JSON.parse(body);
-        if (!isProviderPayload(request.api, payload)) return;
-        const result = analyzePayload(request.api, payload, request.context, seen, hashes, body);
-        const record = {
-          timestamp: new Date().toISOString(), request_id: reporter.count + 1,
-          tool_bytes_projected: request.projectionStats?.toolBytesProjected ?? 0,
-          image_blocks_projected: request.projectionStats?.imageBlocksProjected ?? 0,
-          image_bytes_avoided: request.projectionStats?.imageBytesAvoided ?? 0,
-          projection_ms: request.projectionStats?.projectionMs ?? 0,
-          provider: request.provider, model: request.model, api: request.api,
-          endpoint, transport, context_tokens: null,
-          estimated_context_tokens: request.estimated_context_tokens,
-          candidate_payload_bytes: request.bytes,
-          text_bytes: result.user_text_bytes + result.assistant_text_bytes,
-          content_encoding: header(headers, 'content-encoding'),
-          content_length: header(headers, 'content-length') || null,
-          response_status: null, download_bytes: null, ...result,
-          json_payload_bytes: result.total_payload_bytes, total_payload_bytes: wireBytes,
-          profile_ms: Math.round((performance.now() - started) * 10) / 10,
-        };
-        reporter.add(record);
-        waiting.length = 0;
-        waiting.push(record);
-        uploadedBytes += record.total_payload_bytes;
-        currentBytes = record.total_payload_bytes;
-        if (result.image_count > 0) {
-          originalImageBytes += request.imageStats?.originalBytes ?? 0;
-          sentImageBytes += request.imageStats?.optimizedBytes ?? 0;
-        }
-        save();
-        updateStatus(request.ui);
-        return record;
-      },
+      onRequest: ({ candidate: request, endpoint, headers, body, wireBytes, transport }: any) =>
+        recordRequest({ request, endpoint, headers, body, wireBytes, transport }),
       onResponse: (record: any, status: number) => {
         record.response_status = status;
         save(record);
@@ -208,7 +251,7 @@ export default async function (pi: ExtensionAPI) {
   });
   pi.on('context_with_system', async (event, ctx) => {
     if (!enabled) return;
-    imageStats = undefined; projectionStats = undefined;
+    imageStats = undefined; imageMetrics = undefined; projectionStats = undefined; pendingAcpContinuation = undefined;
     const config = { ...readConfig(configPath), enabled: true };
     memory.config = config;
     let projected = event.messages;
@@ -216,17 +259,35 @@ export default async function (pi: ExtensionAPI) {
       if (!pi.getActiveTools || pi.getActiveTools().includes('context_recall')) {
         const result = await memory.project(event.messages, ctx);
         projected = result.messages; projectionStats = result.stats;
+      } else {
+        memory.last = { skipped: 'recall_inactive' };
       }
     } catch { memory.metrics.failures++; }
     try {
-      const { messages, stats } = await optimizer.optimizeMessages(projected, config, {
+      const { messages, stats, imageMetrics: pairs } = await optimizer.optimizeMessages(projected, config, {
         alreadyOptimized: (message: any) => message.role === 'toolResult' && message.toolName === 'context_recall' && !!message.details?.contextId,
       });
       imageStats = stats;
+      imageMetrics = pairs;
       context = sourcesFromContext(messages);
+      if (ctx?.model && isDirectPayloadApi(ctx.model.api)) {
+        const toolResults = extractAcpMcpToolResults(messages);
+        if (toolResults.length > 0) {
+          pendingAcpContinuation = {
+            payload: { toolResults },
+            context, imageStats: stats, imageMetrics: pairs, projectionStats,
+            provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
+            api: ctx.model.api, baseUrl: ctx.model.baseUrl,
+            estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
+            ui: ctx.hasUI ? ctx.ui : undefined,
+          };
+        }
+      }
       return { messages };
     } catch {
       context = undefined;
+      imageMetrics = undefined;
+      pendingAcpContinuation = undefined;
       return { messages: projected };
     }
   });
@@ -268,19 +329,45 @@ export default async function (pi: ExtensionAPI) {
   pi.on('before_provider_request', (event, ctx) => {
     if (!enabled) return;
     candidate = undefined;
+    pendingDirectRecord = undefined;
+    pendingAcpContinuation = undefined;
     waiting.length = 0;
     try {
       const model = ctx.model;
       if (!model || !isProviderPayload(model.api, event.payload)) return;
-      candidate = {
-        bytes: Buffer.byteLength(JSON.stringify(event.payload), 'utf8'),
-        context, imageStats, projectionStats, provider: model.provider, model: model.id, id: model.id,
+      const body = JSON.stringify(event.payload);
+      const wireBytes = Buffer.byteLength(body, 'utf8');
+      const request = {
+        bytes: wireBytes,
+        context, imageStats, imageMetrics, projectionStats, provider: model.provider, model: model.id, id: model.id,
         api: model.api, baseUrl: model.baseUrl,
         estimated_context_tokens: ctx.getContextUsage()?.tokens ?? null,
         ui: ctx.hasUI ? ctx.ui : undefined,
       };
-    } catch { candidate = undefined; }
-    finally { context = undefined; imageStats = undefined; projectionStats = undefined; }
+      if (isDirectPayloadApi(model.api)) {
+        pendingDirectRecord = recordRequest({
+          request,
+          endpoint: model.baseUrl || 'acp://antigravity-cli',
+          headers: new Headers(),
+          body,
+          wireBytes,
+          transport: 'acp-stdio',
+        });
+      } else {
+        candidate = request;
+      }
+    } catch { candidate = undefined; pendingDirectRecord = undefined; }
+    finally { context = undefined; imageStats = undefined; imageMetrics = undefined; projectionStats = undefined; }
+  });
+  pi.on('after_provider_response', (event) => {
+    if (!enabled || !pendingDirectRecord) return;
+    try {
+      if (typeof event.status === 'number') {
+        pendingDirectRecord.response_status = event.status;
+        save(pendingDirectRecord);
+      }
+    } catch { /* 只读观测。 */ }
+    finally { pendingDirectRecord = undefined; }
   });
   pi.on('message_end', async (event) => {
     if (!enabled) return;
@@ -291,16 +378,38 @@ export default async function (pi: ExtensionAPI) {
       if (event.message.role !== 'assistant') return;
       memory.observeAssistantMessage(event.message);
       candidate = undefined;
-      const record = waiting.shift();
-      if (!record) return;
+      pendingDirectRecord = undefined;
+      const continuation = pendingAcpContinuation;
+      pendingAcpContinuation = undefined;
       const usage = event.message.usage;
-      record.context_tokens = usage ? usage.input + usage.cacheRead + usage.cacheWrite : null;
-      save(record);
+      const contextTokens = usage ? usage.input + usage.cacheRead + usage.cacheWrite : null;
+      const record = waiting.shift();
+      if (record) {
+        record.context_tokens = contextTokens;
+        save(record);
+      } else if (continuation && event.message.stopReason !== 'aborted' && event.message.stopReason !== 'error') {
+        const body = JSON.stringify(continuation.payload);
+        const wireBytes = Buffer.byteLength(body, 'utf8');
+        recordRequest({
+          request: { ...continuation, bytes: wireBytes },
+          endpoint: `${continuation.baseUrl || 'acp://antigravity-cli'}/mcp-result`,
+          headers: new Headers(),
+          body,
+          wireBytes,
+          transport: 'acp-mcp-result',
+          initialStatus: 200,
+          initialContextTokens: contextTokens,
+          enqueueWaiting: false,
+        });
+      }
     } catch { /* 只读观测。 */ }
   });
   pi.on('session_shutdown', async (_event, ctx) => {
     enabled = false;
     memory.config.enabled = false;
+    pendingDirectRecord = undefined;
+    pendingAcpContinuation = undefined;
+    imageMetrics = undefined;
     try { await reporter.close(); } catch { /* 报告故障不能阻止退出。 */ }
     try { await memory.close(); } catch { /* 归档故障不能阻止退出。 */ }
     stopObservation?.();

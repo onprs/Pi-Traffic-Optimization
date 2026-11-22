@@ -345,3 +345,72 @@ test('缓存感知 GC：UTF-8 中文与 system.sections 估算、usage 动态校
   assert.equal(reopened.calibrationFactor, 1.25);
   await reopened.close();
 }, { keepRecentTurns: 4, keepRecentTokens: 12000, minimumToolResultBytes: 4096, oversizedToolResultBytes: 32768 }));
+
+test('pi-antigravity-bridge 镜像工具：agy_edit 多文件失效旧 read、agy_read current 召回、agy_bash 关系与多工具分摊切片校准防护', async () => environment(async ({ directory, memory, ctx }) => {
+  const fileA = join(directory, 'a.ts');
+  const fileB = join(directory, 'b.ts');
+  await writeFile(fileA, 'const a = 1;\n');
+  await writeFile(fileB, 'const b = 1;\n');
+
+  // 1. 先用原生 read 读取 fileA 和 fileB，形成 verified snapshot
+  await memory.observeCall({ toolCallId: 'r-a', toolName: 'read', input: { path: fileA } }, ctx);
+  await memory.observeResult({ toolCallId: 'r-a', toolName: 'read', input: { path: fileA }, content: [{ type: 'text', text: 'const a = 1;\n' }] }, ctx);
+  await memory.observeCall({ toolCallId: 'r-b', toolName: 'read', input: { path: fileB } }, ctx);
+  await memory.observeResult({ toolCallId: 'r-b', toolName: 'read', input: { path: fileB }, content: [{ type: 'text', text: 'const b = 1;\n' }] }, ctx);
+  const objA = memory.results.get('r-a').object;
+  const objB = memory.results.get('r-b').object;
+  assert.equal(objA.snapshotStatus, 'verified_before_after');
+  assert.equal(objB.snapshotStatus, 'verified_before_after');
+
+  // 2. 使用 agy_edit 修改两文件（通过 details.diffs 报告多路径），应使两文件缓存失效并标记 stale
+  await writeFile(fileA, 'const a = 2;\n');
+  await writeFile(fileB, 'const b = 2;\n');
+  await memory.observeCall({ toolCallId: 'ae-1', toolName: 'agy_edit', input: { title: 'Edit files', path: fileA } }, ctx);
+  await memory.observeResult({
+    toolCallId: 'ae-1', toolName: 'agy_edit', input: { title: 'Edit files', path: fileA }, isError: false,
+    content: [{ type: 'text', text: 'Updated a.ts and b.ts' }],
+    details: { path: fileA, diffs: [{ path: fileA, oldText: '1', newText: '2' }, { path: fileB, oldText: '1', newText: '2' }] },
+  }, ctx);
+  assert.ok(memory.working.modifiedFiles[fileA]);
+  assert.ok(memory.working.modifiedFiles[fileB]);
+  assert.equal(memory.archive.get(objA.id).stale, true);
+  assert.equal(memory.archive.get(objB.id).stale, true);
+  const recalledA = JSON.parse((await memory.recall({ id: objA.id })).content[0].text);
+  assert.equal(recalledA.snapshot.state, 'stale');
+
+  // 3. agy_read 归档标记为 source_unverified，纳入 recentReads 并支持 view=current
+  await memory.observeCall({ toolCallId: 'ar-1', toolName: 'agy_read', input: { path: fileA, line: 1 } }, ctx);
+  await memory.observeResult({ toolCallId: 'ar-1', toolName: 'agy_read', input: { path: fileA, line: 1 }, content: [{ type: 'text', text: 'const a = 2;\n' }] }, ctx);
+  const agyReadObj = memory.results.get('ar-1').object;
+  assert.equal(agyReadObj.snapshotStatus, 'source_unverified');
+  assert.equal(memory.working.recentReads[fileA].id, agyReadObj.id);
+  const liveA = JSON.parse((await memory.recall({ id: agyReadObj.id, view: 'current' })).content[0].text);
+  assert.equal(liveA.snapshot.state, 'unverified');
+  assert.match(liveA.text, /const a = 2;/);
+
+  // 4. agy_bash 执行测试，建立 runs_after_edit 关系并记录至 latestTests
+  await memory.observeCall({ toolCallId: 'ab-1', toolName: 'agy_bash', input: { command: 'npm test' } }, ctx);
+  await memory.observeResult({ toolCallId: 'ab-1', toolName: 'agy_bash', input: { command: 'npm test' }, content: [{ type: 'text', text: 'x'.repeat(5000) }] }, ctx);
+  const agyBashObj = memory.results.get('ab-1').object;
+  assert.ok(agyBashObj.related.some(e => e.relation === 'runs_after_edit'));
+  assert.ok(memory.working.latestTests[agyBashObj.id]);
+
+  // 5. 多工具并发分摊切片的极小 input 不应拉低已校准的 calibrationFactor
+  const agyCtx = { ...ctx, model: { provider: 'antigravity', id: 'gemini-4-neon', contextWindow: 1048576 } };
+  const big = '中'.repeat(24000);
+  const history = [assistant('c1'), result('c1', big), ...tail(6)];
+  await memory.project(history, agyCtx);
+  memory.observeAssistantMessage({
+    role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse',
+    usage: { input: 10000, cacheRead: 35000, cacheWrite: 0, output: 100 },
+  });
+  const calibrated = memory.calibrationFactor;
+  assert.ok(calibrated > 1.2, `全窗口样本应提升校准系数: ${calibrated}`);
+  await memory.project(history, agyCtx);
+  // 模拟多工具并发后续切片（仅 300 tokens）
+  memory.observeAssistantMessage({
+    role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse',
+    usage: { input: 60, cacheRead: 240, cacheWrite: 0, output: 20 },
+  });
+  assert.equal(memory.calibrationFactor, calibrated, '多工具分摊切片不应污染校准系数');
+}, { keepRecentTurns: 4, keepRecentTokens: 12000, minimumToolResultBytes: 4096, oversizedToolResultBytes: 32768 }));

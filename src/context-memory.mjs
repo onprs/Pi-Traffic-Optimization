@@ -9,6 +9,9 @@ const { ContextArchive, hash, utf8Bytes } = await import(new URL('./archive.mjs'
 const { fingerprint } = await import(new URL('./optimizer.mjs' + revision, import.meta.url).href);
 
 const textOf = (content) => (content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+const READ_TOOLS = new Set(['read', 'agy_read']);
+const EDIT_TOOLS = new Set(['edit', 'write', 'agy_edit', 'agy_write']);
+const SHELL_TOOLS = new Set(['bash', 'powershell', 'agy_bash']);
 const signature = (content) => (content ?? []).flatMap(b => b.type === 'image' ? [b.type, b.mimeType, b.data] : [b.type, b.text ?? JSON.stringify(b)]);
 const equal = (a, b) => a?.length === b.length && a.every((v, i) => v === b[i]);
 const emptyMetrics = () => ({ toolOutputsArchived: 0, toolBytesProjected: 0, imageBlocksProjected: 0,
@@ -76,7 +79,9 @@ export class ContextMemory {
     const modelKey = `${message.provider ?? ''}:${message.model ?? ''}`;
     const sample = this.lastCalibrationSample;
     this.lastCalibrationSample = undefined;
-    if (sample && sample.modelKey === modelKey && actualInput > 0 && sample.uncalibratedTokens >= 16384) {
+    // 过滤多工具并发切片回报的极小分摊样本，避免拉低正常上下文校准系数。
+    if (sample && sample.modelKey === modelKey && actualInput > 0 && sample.uncalibratedTokens >= 16384 &&
+      actualInput >= sample.uncalibratedTokens * 0.25) {
       const ratio = Math.max(1, Math.min(1.8, actualInput / sample.uncalibratedTokens));
       this.calibrationFactor = this.calibrationFactor === 1 ? ratio : 0.35 * ratio + 0.65 * this.calibrationFactor;
       this.calibrationModel = modelKey;
@@ -156,6 +161,19 @@ export class ContextMemory {
     const keys = Object.keys(map);
     for (const key of keys.slice(0, Math.max(0, keys.length - this.options.stateLimit))) delete map[key];
   }
+  modifiedPaths(toolName, input = {}, details, cwd = this.cwd) {
+    const hasDiffs = typeof toolName === 'string' && toolName.startsWith('agy_') && Array.isArray(details?.diffs) && details.diffs.length > 0;
+    if (!EDIT_TOOLS.has(toolName) && !hasDiffs) return [];
+    const seen = new Set();
+    const collect = (raw) => {
+      const resolved = this.filePath(raw, cwd);
+      if (resolved) seen.add(resolved);
+    };
+    collect(input?.path);
+    collect(details?.path);
+    for (const diff of details?.diffs ?? []) collect(diff?.path);
+    return [...seen];
+  }
   async observeCall(event, ctx) {
     if (!this.enabled || event.toolName === 'context_recall') return;
     const input = structuredClone(event.input ?? {});
@@ -179,11 +197,13 @@ export class ContextMemory {
       if (event.input.path !== call.input?.path) call.before = undefined;
       call.input = structuredClone(event.input); this.calls.set(event.toolCallId, call);
     }
-    const path = this.filePath(call.input?.path, call.cwd);
-    if (path && ['edit', 'write'].includes(event.toolName) && !event.isError) {
-      this.versions.delete(path);
-      this.archive.markStale(path);
-      this.working.modifiedFiles[path] = { turn: this.turn, toolCallId: event.toolCallId };
+    const editedPaths = this.modifiedPaths(event.toolName, call.input, event.details, call.cwd);
+    if (editedPaths.length && !event.isError) {
+      for (const path of editedPaths) {
+        this.versions.delete(path);
+        this.archive.markStale(path);
+        this.working.modifiedFiles[path] = { turn: this.turn, toolCallId: event.toolCallId };
+      }
       this.trimMap(this.working.modifiedFiles);
     }
     await this.capture({ ...event, role: 'toolResult', timestamp: this.clock() }, call);
@@ -199,7 +219,10 @@ export class ContextMemory {
     const began = performance.now();
     const input = call.input ?? {};
     const cwd = call.cwd ?? this.cwd;
-    const path = this.filePath(input.path, cwd);
+    const editedPaths = this.modifiedPaths(message.toolName, input, message.details, cwd);
+    const path = this.filePath(input.path ?? message.details?.path ?? message.details?.diffs?.[0]?.path, cwd);
+    const command = input.command ?? message.details?.command;
+    const query = input.pattern ?? input.query ?? message.details?.query;
     const originalText = textOf(message.content);
     const containsImages = message.content.some(b => b.type === 'image');
     const size = utf8Bytes(originalText);
@@ -207,15 +230,16 @@ export class ContextMemory {
       this.results.set(source, { signature: sig, object: undefined }); return undefined;
     }
     // 小型文件操作也归档，以便查询历史和建立关系；普通小输出保留原样。
-    if (!recallPage && size < this.options.minimumToolResultBytes && !containsImages && !['read', 'edit', 'write'].includes(message.toolName)) return undefined;
+    if (!recallPage && size < this.options.minimumToolResultBytes && !containsImages &&
+      !READ_TOOLS.has(message.toolName) && !EDIT_TOOLS.has(message.toolName) && editedPaths.length === 0) return undefined;
     const related = [];
     if (recallPage && message.details?.contextId) related.push({ id: message.details.contextId, relation: 'recalls' });
     if (call.parentToolCallId) related.push({ id: `call:${this.sessionId}:${call.parentToolCallId}`, relation: 'nested_in' });
     for (const id of this.recallParents.get(source) ?? []) related.push({ id, relation: 'recalls' });
     for (const id of this.children.get(source) ?? []) related.push({ id, relation: 'contains_nested_result' });
     if (path && this.working.recentReads[path]) related.push({ id: this.working.recentReads[path].id, relation: 'same_file' });
-    if (['edit', 'write'].includes(message.toolName) && this.lastFailure) related.push({ id: this.lastFailure, relation: 'after_failure' });
-    if (['bash', 'powershell'].includes(message.toolName) && this.lastEdit) related.push({ id: this.lastEdit, relation: 'runs_after_edit' });
+    if ((EDIT_TOOLS.has(message.toolName) || editedPaths.length > 0) && this.lastFailure) related.push({ id: this.lastFailure, relation: 'after_failure' });
+    if (SHELL_TOOLS.has(message.toolName) && this.lastEdit) related.push({ id: this.lastEdit, relation: 'runs_after_edit' });
     const content = [];
     let imageBytes = 0;
     for (const block of message.content) {
@@ -258,6 +282,9 @@ export class ContextMemory {
         fileHashAtRead = after.hash; snapshotStatus = 'verified_before_after';
       } else snapshotStatus = call.historical || !call.before ? 'historical_unverified' : 'source_unverified';
       if (call.before) delete call.before.snapshotText;
+    } else if (message.toolName === 'agy_read' && path) {
+      // AGY 镜像读工具由远端/子进程直接执行，无法做本地调用前后的精确文件校验。
+      snapshotStatus = call.historical ? 'historical_unverified' : 'source_unverified';
     }
     const metadata = { id, kind: 'tool', toolName: message.toolName, toolCallId: source,
       createdAt: this.clock(), sourceTimestamp: message.timestamp ?? null,
@@ -266,12 +293,15 @@ export class ContextMemory {
       textBytes: size, fullOutputBytes: utf8Bytes(fullText), imageBytes, estimatedTokens: Math.ceil(size / 3) + (containsImages ? 1000 : 0),
       input: storedInput, argumentHash, argumentBlob: argumentsArchived ? argumentHash : undefined,
       isError: Boolean(message.isError), sessionId: this.sessionId, sessionFile: this.sessionFile,
-      cwd, path, turn: call.turn ?? this.turn, command: input.command?.slice(0, 1024),
+      cwd, path, modifiedPaths: editedPaths.length > 1 || (editedPaths.length === 1 && !EDIT_TOOLS.has(message.toolName)) ? editedPaths : undefined,
+      turn: call.turn ?? this.turn, command: command?.slice(0, 1024),
       exitCode: typeof structured.exit_code === 'number' ? structured.exit_code : null,
       durationSeconds: structured.wall_time_seconds ?? (call.startedAt ? (this.clock() - call.startedAt) / 1000 : null),
-      range: message.toolName === 'read' ? { offset: input.offset ?? 1, limit: input.limit ?? null } : undefined,
+      range: message.toolName === 'read'
+        ? { offset: input.offset ?? 1, limit: input.limit ?? null }
+        : message.toolName === 'agy_read' ? { offset: input.line ?? 1, limit: null } : undefined,
       fileHashAtRead, snapshotHash: hash(originalText), snapshotStatus,
-      query: input.pattern ?? input.query, paths: input.paths ?? input.path,
+      query, paths: input.paths ?? input.path ?? message.details?.path,
       matchCount: typeof structured.match_count === 'number' ? structured.match_count : null,
       parentToolCallId: call.parentToolCallId, related };
     const searchText = JSON.stringify({ tool: message.toolName, input: storedInput, path }) + '\n' + fullText;
@@ -296,23 +326,29 @@ export class ContextMemory {
   updateWorking(o) {
     const { id, path, toolName, input } = o;
     if (o.isError) this.lastFailure = id;
-    if (path) {
-      delete this.working.activeFiles[path];
-      this.working.activeFiles[path] = { id, turn: o.turn ?? this.turn }; this.trimMap(this.working.activeFiles);
-      if (toolName === 'read') {
-        this.working.recentReads[path] = { id, range: o.range, fileHash: o.fileHashAtRead };
-        this.trimMap(this.working.recentReads);
-      }
-      if (['edit', 'write'].includes(toolName) && !o.isError) {
-        this.lastEdit = id;
-        this.working.modifiedFiles[path] = { id, turn: o.turn ?? this.turn, toolCallId: o.toolCallId };
-        this.trimMap(this.working.modifiedFiles);
-      }
+    const isEdit = EDIT_TOOLS.has(toolName) || (Array.isArray(o.modifiedPaths) && o.modifiedPaths.length > 0);
+    const touchedPaths = Array.isArray(o.modifiedPaths) && o.modifiedPaths.length > 0 ? o.modifiedPaths : (path ? [path] : []);
+    for (const p of touchedPaths) {
+      delete this.working.activeFiles[p];
+      this.working.activeFiles[p] = { id, turn: o.turn ?? this.turn };
     }
-    if (input?.command) {
-      this.working.latestCommands[id] = { command: input.command.slice(0, 256), exitCode: o.exitCode };
+    if (touchedPaths.length) this.trimMap(this.working.activeFiles);
+    if (path && READ_TOOLS.has(toolName)) {
+      this.working.recentReads[path] = { id, range: o.range, fileHash: o.fileHashAtRead };
+      this.trimMap(this.working.recentReads);
+    }
+    if (isEdit && touchedPaths.length && !o.isError) {
+      this.lastEdit = id;
+      for (const p of touchedPaths) {
+        this.working.modifiedFiles[p] = { id, turn: o.turn ?? this.turn, toolCallId: o.toolCallId };
+      }
+      this.trimMap(this.working.modifiedFiles);
+    }
+    const command = input?.command ?? o.command;
+    if (command) {
+      this.working.latestCommands[id] = { command: command.slice(0, 256), exitCode: o.exitCode };
       this.trimMap(this.working.latestCommands);
-      if (/\b(test|pytest|vitest|ctest|build|cmake|cargo|tsc)\b/i.test(input.command)) {
+      if (/\b(test|pytest|vitest|ctest|build|cmake|cargo|tsc)\b/i.test(command)) {
         this.working.latestTests[id] = this.working.latestCommands[id]; this.trimMap(this.working.latestTests);
       }
     }
@@ -763,7 +799,7 @@ export class ContextMemory {
   }
 
   async snapshotStatus(o) {
-    if (o.toolName !== 'read' || !o.path) return undefined;
+    if (!READ_TOOLS.has(o.toolName) || !o.path) return undefined;
     if (!o.fileHashAtRead) return { state: 'unverified', message: '历史 read 的文件 hash 无法验证；此内容仅代表当时返回的 snapshot。' };
     const current = await this.version(o.path);
     const same = current.status === 'verified' && current.hash === o.fileHashAtRead;
@@ -915,7 +951,7 @@ export class ContextMemory {
         if (params.part === 'structured') text = JSON.stringify(blob.structuredContent
           ? { ...blob.structuredContent, ...(fullText === undefined ? {} : { output: fullText }) } : blob.details ?? {}, null, 2);
         if (params.view && params.view !== 'snapshot') {
-          if (o.toolName !== 'read' || !o.path) throw new Error('current/diff 仅用于本地文件 read snapshot');
+          if (!READ_TOOLS.has(o.toolName) || !o.path) throw new Error('current/diff 仅用于本地文件 read snapshot');
           if (blob.content.some(b => b.type === 'archivedImage')) throw new Error('current/diff 只支持文本 snapshot；需要当前图片时请读取当前文件');
           const currentStat = await stat(o.path);
           if (currentStat.size > this.options.archive.maxFileHashMB * 1048576) throw new Error('当前文件超过安全读取上限');

@@ -7,8 +7,11 @@ const families = new Map([
   ['openai-responses', 'responses'], ['azure-openai-responses', 'responses'], ['openai-codex-responses', 'responses'],
   ['openai-completions', 'chat'], ['mistral-conversations', 'chat'], ['anthropic-messages', 'anthropic'],
   ['google-generative-ai', 'google'], ['google-vertex', 'google'], ['bedrock-converse-stream', 'bedrock'],
-  ['pi-messages', 'pi'],
+  ['pi-messages', 'pi'], ['antigravity-acp', 'acp'],
 ]);
+
+// 使用非 HTTP 传输并通过 before_provider_request 直接交付出站载荷的协议。
+export const isDirectPayloadApi = (api) => families.get(api) === 'acp';
 
 export function isProviderPayload(api, payload) {
   if (!payload || typeof payload !== 'object') return false;
@@ -16,6 +19,7 @@ export function isProviderPayload(api, payload) {
     case 'responses': return typeof payload.input === 'string' || Array.isArray(payload.input);
     case 'google': return Array.isArray(payload.contents);
     case 'pi': return Array.isArray(payload.context?.messages);
+    case 'acp': return (typeof payload.sessionId === 'string' && Array.isArray(payload.prompt)) || Array.isArray(payload.toolResults);
     case 'chat': case 'anthropic': case 'bedrock': return Array.isArray(payload.messages);
     default: return false;
   }
@@ -23,7 +27,7 @@ export function isProviderPayload(api, payload) {
 
 // 只匹配当前模型所属的推理入口；查询参数、凭据和其他 HTTP 请求不进入报告。
 export function matchesProviderEndpoint(model, input) {
-  if (!families.has(model.api)) return false;
+  if (!families.has(model.api) || isDirectPayloadApi(model.api)) return false;
   const url = new URL(input);
   if (!['http:', 'https:'].includes(url.protocol)) return false;
   let base;
@@ -78,7 +82,7 @@ export function sourcesFromContext(messages) {
     for (const block of content) {
       if (block.type !== 'image' || typeof block.data !== 'string') continue;
       const source = message.role === 'toolResult'
-        ? message.toolName === 'read' ? 'toolResult/read image' : 'toolResult/other'
+        ? (message.toolName === 'read' || message.toolName === 'agy_read') ? 'toolResult/read image' : 'toolResult/other'
         : message.role === 'user' ? 'user image' : 'unknown';
       sources.push({ data: block.data, source, mime: block.mimeType });
     }
@@ -284,6 +288,58 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
             for (const section of Object.values(message.sections ?? {})) addText('system_bytes', section);
             addJson('tool_schema_bytes', message.toolsAdded);
           }
+        }
+      }
+      break;
+    case 'acp':
+      if (Array.isArray(payload.prompt)) {
+        let activeResult;
+        for (const item of payload.prompt) {
+          if (!item) continue;
+          if (item.type === 'text' && typeof item.text === 'string') {
+            if (/^<(?:workspace_context|task_instructions)>[\s\S]*<\/(?:workspace_context|task_instructions)>$/.test(item.text)) {
+              activeResult = undefined;
+              addText('system_bytes', item.text);
+            } else {
+              const toolMatch = /^<tool_result\b([^>]*)>[\s\S]*<\/tool_result>$/.exec(item.text);
+              if (toolMatch) {
+                const nameMatch = /\btool="([^"]+)"/.exec(toolMatch[1]);
+                const toolName = nameMatch?.[1] ?? 'unknown';
+                result(toolName, () => addText('tool_result_bytes', item.text));
+                activeResult = results.at(-1);
+              } else if (/^<assistant\b[^>]*>[\s\S]*<\/assistant>$/.test(item.text)) {
+                activeResult = undefined;
+                addText('assistant_text_bytes', item.text);
+              } else {
+                activeResult = undefined;
+                addText('user_text_bytes', item.text);
+              }
+            }
+          } else if (item.type === 'image') {
+            const beforeImage = parts.image_payload_bytes;
+            addBase64(item.data, item.mimeType, activeResult?.tool_name);
+            if (activeResult) activeResult.image_bytes += parts.image_payload_bytes - beforeImage;
+          } else if (item.type === 'resource') {
+            activeResult = undefined;
+            if (typeof item.resource?.text === 'string') addText('user_text_bytes', item.resource.text);
+            if (typeof item.resource?.blob === 'string' && typeof item.resource?.mimeType === 'string' && item.resource.mimeType.startsWith('image/')) {
+              addBase64(item.resource.blob, item.resource.mimeType);
+            }
+          } else {
+            activeResult = undefined;
+          }
+        }
+      } else if (Array.isArray(payload.toolResults)) {
+        for (const item of payload.toolResults) {
+          if (!item) continue;
+          const toolName = item.toolName || calls.get(item.toolCallId) || 'unknown';
+          result(toolName, () => {
+            for (const block of item.content ?? []) {
+              if (!block) continue;
+              if (block.type === 'text') addText('tool_result_bytes', block.text);
+              else if (block.type === 'image') addBase64(block.data, block.mimeType, toolName);
+            }
+          });
         }
       }
       break;

@@ -110,13 +110,13 @@ export class ImageOptimizer {
     }
     const buffer = await readFile(path);
     if (buffer.length < 12 || buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WEBP') throw new Error('Cached image is invalid');
-    const value = { data: buffer.toString('base64'), bytes: buffer.length, mimeType: 'image/webp', createdAt: details.mtimeMs };
+    const value = { data: buffer.toString('base64'), bytes: buffer.length, mimeType: 'image/webp', optimizedHash: sha256(buffer), createdAt: details.mtimeMs };
     this.remember(key, value);
     return value;
   }
 
   async store(key, buffer, config) {
-    const value = { data: buffer.toString('base64'), bytes: buffer.length, mimeType: 'image/webp', createdAt: Date.now() };
+    const value = { data: buffer.toString('base64'), bytes: buffer.length, mimeType: 'image/webp', optimizedHash: sha256(buffer), createdAt: Date.now() };
     if (config.cache.enabled) {
       await mkdir(this.cacheDir, { recursive: true });
       const temporary = join(this.cacheDir, `${key}.${randomUUID()}.tmp`);
@@ -191,7 +191,7 @@ export class ImageOptimizer {
     for (const name of entries) if (cacheFile.test(name) || temporaryFile.test(name)) await rm(join(this.cacheDir, name));
   }
 
-  async optimizeImage(image, config, stats) {
+  async optimizeImage(image, config, stats, imageMetrics) {
     stats.images++;
     const began = performance.now();
     try {
@@ -202,12 +202,13 @@ export class ImageOptimizer {
       }
       const original = Buffer.from(image.data, 'base64');
       stats.originalBytes += original.length;
+      const hash = sha256(original);
       if (original.length < config.skipBelowKB * 1024) {
         stats.skipped++;
         stats.optimizedBytes += original.length;
+        imageMetrics?.set(hash, { originalBytes: original.length, optimizedBytes: original.length });
         return image;
       }
-      const hash = sha256(original);
       if (!this.seen.has(hash)) { this.seen.add(hash); stats.unique++; }
       const key = sha256(`${hash}:${fingerprint(config)}`);
       const hit = await this.lookup(key, config);
@@ -215,7 +216,13 @@ export class ImageOptimizer {
         stats.hits++;
         stats.hitMs += performance.now() - began;
         stats.optimizedBytes += hit.skip ? original.length : hit.bytes;
-        if (hit.skip) { stats.skipped++; return image; }
+        if (hit.skip) {
+          stats.skipped++;
+          imageMetrics?.set(hash, { originalBytes: original.length, optimizedBytes: original.length });
+          return image;
+        }
+        const hitHash = hit.optimizedHash ?? sha256(Buffer.from(hit.data, 'base64'));
+        imageMetrics?.set(hitHash, { originalBytes: original.length, optimizedBytes: hit.bytes });
         return { ...image, data: hit.data, mimeType: hit.mimeType };
       }
       stats.misses++;
@@ -224,6 +231,7 @@ export class ImageOptimizer {
         await this.storeSkip(key, config);
         stats.skipped++;
         stats.optimizedBytes += original.length;
+        imageMetrics?.set(hash, { originalBytes: original.length, optimizedBytes: original.length });
         return image;
       }
       const edge = Math.max(meta.width, meta.height);
@@ -254,15 +262,19 @@ export class ImageOptimizer {
         await this.storeSkip(key, config);
         stats.skipped++;
         stats.optimizedBytes += original.length;
+        imageMetrics?.set(hash, { originalBytes: original.length, optimizedBytes: original.length });
         return image;
       }
       const result = await this.store(key, best, config);
       stats.optimizedBytes += result.bytes;
+      imageMetrics?.set(result.optimizedHash, { originalBytes: original.length, optimizedBytes: result.bytes });
       return { ...image, data: result.data, mimeType: result.mimeType };
     } catch {
       stats.errors++;
       if (typeof image?.data === 'string' && validBase64(image.data) && validMime.has(image.mimeType)) {
-        stats.optimizedBytes += Buffer.from(image.data, 'base64').length;
+        const fallback = Buffer.from(image.data, 'base64');
+        stats.optimizedBytes += fallback.length;
+        imageMetrics?.set(sha256(fallback), { originalBytes: fallback.length, optimizedBytes: fallback.length });
       }
       return image;
     } finally { stats.processingMs += performance.now() - began; }
@@ -270,7 +282,8 @@ export class ImageOptimizer {
 
   async optimizeMessages(messages, config, { alreadyOptimized = () => false } = {}) {
     const stats = emptyStats();
-    if (!config.enabled) return { messages, stats };
+    const imageMetrics = new Map();
+    if (!config.enabled) return { messages, stats, imageMetrics };
     stats.requests = 1;
     const transformed = [];
     for (const message of messages) {
@@ -282,15 +295,17 @@ export class ImageOptimizer {
       for (const item of message.content) {
         if (item?.type !== 'image') { content.push(item); continue; }
         if (alreadyOptimized(message)) {
-          const size = Buffer.from(item.data, 'base64').length;
+          const buffer = Buffer.from(item.data, 'base64');
+          const size = buffer.length;
           stats.images++; stats.originalBytes += size; stats.optimizedBytes += size; stats.archiveReuses++;
+          imageMetrics.set(sha256(buffer), { originalBytes: size, optimizedBytes: size });
           content.push(item);
-        } else content.push(await this.optimizeImage(item, config, stats));
+        } else content.push(await this.optimizeImage(item, config, stats, imageMetrics));
       }
       transformed.push({ ...message, content });
     }
     for (const key of Object.keys(stats)) this.totals[key] += stats[key];
     this.last = metrics(stats);
-    return { messages: transformed, stats };
+    return { messages: transformed, stats, imageMetrics };
   }
 }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { analyzePayload, isProviderPayload, matchesProviderEndpoint, sourcesFromContext } from '../src/profile.mjs';
+import { analyzePayload, isDirectPayloadApi, isProviderPayload, matchesProviderEndpoint, sourcesFromContext } from '../src/profile.mjs';
 
 const data = Buffer.from('协议图片').toString('base64');
 const imageUrl = `data:image/png;base64,${data}`;
@@ -123,4 +123,68 @@ test('未知协议和远程图片地址保持未分类，Responses 支持字符�
   const remote = analyzePayload('openai-completions', { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://images.test/photo.png' } }] }] });
   assert.equal(remote.image_count, 0);
   assert.equal(analyzePayload('openai-responses', { input: '中文' }).user_text_bytes, 6);
+});
+
+test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、字节守恒且不误匹配 HTTP 端点', () => {
+  assert.equal(isDirectPayloadApi('antigravity-acp'), true);
+  assert.equal(isDirectPayloadApi('openai-responses'), false);
+  assert.equal(matchesProviderEndpoint({ api: 'antigravity-acp', id: 'gemini-4-neon', baseUrl: 'acp://antigravity-cli' }, 'http://127.0.0.1:12345/mcp'), false);
+  assert.equal(matchesProviderEndpoint({ api: 'antigravity-acp', id: 'gemini-4-neon', baseUrl: 'https://example.test' }, 'https://example.test/v1/responses'), false);
+
+  const agyContext = sourcesFromContext([
+    { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+    { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_1', name: 'agy_read' }] },
+    { role: 'toolResult', toolCallId: 'agy_mcp_1', toolName: 'agy_read', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+  ]);
+  assert.deepEqual(agyContext.sources.map(item => item.source), ['user image', 'toolResult/read image']);
+
+  const acpPromptPayload = {
+    sessionId: 'agy-session-1',
+    prompt: [
+      { type: 'text', text: '<workspace_context>\n<cwd>/repo</cwd>\n</workspace_context>' },
+      { type: 'text', text: '用户提问' },
+      { type: 'image', data, mimeType: 'image/png' },
+      { type: 'text', text: '<assistant model="gemini-4-neon">\n收到。\n</assistant>' },
+      { type: 'text', text: '<tool_result id="agy_mcp_1" tool="agy_read" status="ok">\n结果\n</tool_result>' },
+      { type: 'image', data, mimeType: 'image/png' },
+      { type: 'resource', resource: { uri: 'file:///note.txt', mimeType: 'text/plain', text: '附注' } },
+      { type: 'resource_link', uri: 'file:///ref.md', name: 'ref' },
+    ],
+  };
+  const beforePrompt = JSON.stringify(acpPromptPayload);
+  assert.equal(isProviderPayload('antigravity-acp', acpPromptPayload), true);
+  const promptMetrics = analyzePayload('antigravity-acp', acpPromptPayload, agyContext);
+  assert.equal(JSON.stringify(acpPromptPayload), beforePrompt);
+  assert.equal(promptMetrics.total_payload_bytes, Buffer.byteLength(beforePrompt));
+  for (const key of ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_result_bytes', 'image_payload_bytes']) {
+    assert.ok(promptMetrics[key] > 0, `antigravity-acp 缺少 ${key}`);
+  }
+  assert.deepEqual(promptMetrics.images.map(image => image.source_type), ['user image', 'toolResult/read image']);
+  assert.equal(promptMetrics.images[1].tool_name, 'agy_read');
+  assert.equal(promptMetrics.results.length, 1);
+  assert.equal(promptMetrics.results[0].tool_name, 'agy_read');
+  assert.equal(promptMetrics.results[0].image_bytes, data.length);
+  assert.equal(promptMetrics.total_payload_bytes, ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_call_bytes',
+    'tool_result_bytes', 'image_payload_bytes', 'tool_schema_bytes', 'other_bytes'].reduce((sum, key) => sum + promptMetrics[key], 0));
+
+  const mcpPayload = {
+    toolResults: [
+      {
+        toolCallId: 'agy_mcp_1',
+        toolName: 'read',
+        isError: false,
+        content: [{ type: 'text', text: '文件内容' }, { type: 'image', data, mimeType: 'image/png' }],
+      },
+    ],
+  };
+  const beforeMcp = JSON.stringify(mcpPayload);
+  assert.equal(isProviderPayload('antigravity-acp', mcpPayload), true);
+  const mcpMetrics = analyzePayload('antigravity-acp', mcpPayload, context);
+  assert.equal(mcpMetrics.total_payload_bytes, Buffer.byteLength(beforeMcp));
+  assert.ok(mcpMetrics.tool_result_bytes > 0);
+  assert.equal(mcpMetrics.image_payload_bytes, data.length);
+  assert.equal(mcpMetrics.results[0].tool_name, 'read');
+  assert.equal(mcpMetrics.results[0].image_bytes, data.length);
+  assert.equal(mcpMetrics.total_payload_bytes, ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_call_bytes',
+    'tool_result_bytes', 'image_payload_bytes', 'tool_schema_bytes', 'other_bytes'].reduce((sum, key) => sum + mcpMetrics[key], 0));
 });

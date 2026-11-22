@@ -8,6 +8,7 @@ import { zstdDecompressSync } from 'node:zlib';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { installedPi, fixtures } from './sdk-runner.mjs';
 import register from '../src/index.ts';
 
@@ -190,4 +191,168 @@ test('Pi SDK：全部内置协议的优化、序列化、最终传输与报告�
     const workspace = join(directory, 'workspace'); const fixture = await fixtures(workspace);
     for (const api of apis) await t.test(api, { timeout: 10000 }, () => runProtocol({ ...pi, api, workspace, fixture, directory: join(directory, api) }));
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('Pi SDK：antigravity-acp 自定义 streamSimple provider 的投影契约、图片压缩与直接载荷报告相符', { timeout: 30000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'pi-antigravity-sdk-'));
+  const keys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_ARCHIVE_DIR', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  let session;
+  try {
+    const { sdk, root } = await installedPi();
+    const piAi = await import(import.meta.resolve('@earendil-works/pi-ai', pathToFileURL(join(root, 'package.json')).href));
+    const workspace = join(directory, 'workspace'); const fixture = await fixtures(workspace);
+    Object.assign(process.env, {
+      PI_TRAFFIC_OPT_CONFIG_PATH: join(directory, 'config.json'),
+      PI_TRAFFIC_OPT_ARCHIVE_DIR: join(directory, 'archive'),
+      PI_TRAFFIC_OPT_CACHE_DIR: join(directory, 'cache'),
+      PI_TRAFFIC_OPT_REPORT_DIR: join(directory, 'report'),
+    });
+    await writeFile(process.env.PI_TRAFFIC_OPT_CONFIG_PATH, JSON.stringify({
+      enabled: true, logging: 'off', skipBelowKB: 0,
+      contextOptimization: { keepRecentTurns: 1, keepRecentTokens: 0 },
+    }));
+
+    const observedPayloads = [];
+    const agentDir = join(directory, 'agent'); await mkdir(agentDir, { recursive: true });
+    const runtime = await sdk.ModelRuntime.create({
+      authPath: join(agentDir, 'auth.json'), modelsPath: null,
+      modelsStorePath: join(agentDir, 'models-store.json'), refreshOnCreate: false, allowModelNetwork: false,
+    });
+    const api = 'antigravity-acp';
+    runtime.registerProvider('antigravity', {
+      api, baseUrl: 'acp://antigravity-cli', apiKey: 'agy-managed',
+      models: [{
+        api, id: 'gemini-4-neon', name: 'Gemini 4 Neon', reasoning: true, input: ['text', 'image'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 8192,
+      }],
+      // 模拟 pi-antigravity-bridge 的 streamSimple：把可见消息转成 ACP session/prompt 并触发 onPayload/onResponse。
+      streamSimple: (model, context, options) => {
+        const stream = piAi.createAssistantMessageEventStream();
+        queueMicrotask(async () => {
+          try {
+            const prompt = [{ type: 'text', text: '<workspace_context>\n<cwd>/workspace</cwd>\n</workspace_context>' }];
+            for (const msg of context.messages) {
+              if (msg.role === 'toolResult') {
+                const text = (msg.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+                prompt.push({ type: 'text', text: `<tool_result id="${msg.toolCallId}" tool="${msg.toolName}" status="ok">\n${text}\n</tool_result>` });
+                for (const b of msg.content ?? []) if (b.type === 'image') prompt.push({ type: 'image', data: b.data, mimeType: b.mimeType });
+              } else if (msg.role === 'user') {
+                if (typeof msg.content === 'string') prompt.push({ type: 'text', text: msg.content });
+                else for (const b of msg.content ?? []) {
+                  if (b.type === 'text') prompt.push({ type: 'text', text: b.text });
+                  else if (b.type === 'image') prompt.push({ type: 'image', data: b.data, mimeType: b.mimeType });
+                }
+              } else if (msg.role === 'assistant') {
+                const text = (msg.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+                if (text) prompt.push({ type: 'text', text: `<assistant model="${msg.model}">\n${text}\n</assistant>` });
+              }
+            }
+            const outbound = { sessionId: 'agy-sdk-1', prompt };
+            const finalPayload = (await options?.onPayload?.(outbound, model)) ?? outbound;
+            observedPayloads.push(finalPayload);
+            await options?.onResponse?.({ status: 200, headers: { 'x-acp-session-id': 'agy-sdk-1' } }, model);
+            const message = {
+              role: 'assistant', api, provider: model.provider, model: model.id,
+              content: [{ type: 'text', text: '完成。' }],
+              usage: { ...usage, input: 10, cacheRead: 20, totalTokens: 31 },
+              stopReason: 'stop', timestamp: Date.now(),
+            };
+            stream.push({ type: 'start', partial: message });
+            stream.push({ type: 'done', reason: 'stop', message });
+            stream.end(message);
+          } catch (error) {
+            stream.push({ type: 'error', reason: 'error', error: { role: 'assistant', api, provider: model.provider, model: model.id, content: [], usage, stopReason: 'error', errorMessage: String(error), timestamp: Date.now() } });
+            stream.end();
+          }
+        });
+        return stream;
+      },
+    });
+
+    const model = runtime.getModel('antigravity', 'gemini-4-neon');
+    const settings = sdk.SettingsManager.inMemory({
+      defaultTools: ['read', 'context_recall'], transport: 'sse',
+      compaction: { enabled: false }, retry: { enabled: false }, images: { autoResize: false }, cacheWarming: 'off',
+    });
+    const loader = new sdk.DefaultResourceLoader({
+      cwd: workspace, agentDir, settingsManager: settings,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      systemPrompt: '核对 ACP 协议请求。', extensionFactories: [register],
+    });
+    await loader.reload(); assert.deepEqual(loader.getExtensions().errors, []);
+    const manager = sdk.SessionManager.create(workspace, join(directory, 'sessions'));
+    const timestamp = Date.now();
+    manager.appendMessage({ role: 'user', content: '读取文件。', timestamp });
+    manager.appendMessage({
+      role: 'assistant', api, provider: model.provider, model: model.id,
+      content: [{ type: 'toolCall', id: 'agy_mcp_read_1', name: 'read', arguments: { path: join(workspace, 'source.ts') } }],
+      usage, stopReason: 'toolUse', timestamp,
+    });
+    manager.appendMessage({
+      role: 'toolResult', toolCallId: 'agy_mcp_read_1', toolName: 'read',
+      content: [{ type: 'text', text: fixture.text }], isError: false, timestamp,
+    });
+    for (let i = 0; i < 3; i++) {
+      manager.appendMessage({ role: 'user', content: `继续核对 ${i}。`, timestamp });
+      manager.appendMessage({
+        role: 'assistant', api, provider: model.provider, model: model.id,
+        content: [{ type: 'text', text: '继续。' }], usage, stopReason: 'stop', timestamp,
+      });
+    }
+    manager.appendMessage({
+      role: 'assistant', api, provider: model.provider, model: model.id,
+      content: [{ type: 'toolCall', id: 'agy_mcp_read_img', name: 'read', arguments: { path: join(workspace, 'image.png') } }],
+      usage, stopReason: 'toolUse', timestamp,
+    });
+    manager.appendMessage({
+      role: 'toolResult', toolCallId: 'agy_mcp_read_img', toolName: 'read',
+      content: [{ type: 'text', text: '图片内容。' }, { type: 'image', data: fixture.png.toString('base64'), mimeType: 'image/png' }],
+      isError: false, timestamp,
+    });
+
+    ({ session } = await sdk.createAgentSession({
+      cwd: workspace, agentDir, resourceLoader: loader, modelRuntime: runtime,
+      model, thinkingLevel: 'off', sessionManager: manager, settingsManager: settings,
+    }));
+    await session.bindExtensions({});
+    const errors = [];
+    session.subscribe(event => {
+      if (event.type === 'message_end' && event.message.role === 'assistant' && event.message.stopReason === 'error') errors.push(event.message.errorMessage);
+    });
+    await session.prompt('核对 ACP 图片并完成。', { images: [{ type: 'image', data: fixture.png.toString('base64'), mimeType: 'image/png' }] });
+    assert.deepEqual(errors, []);
+    assert.equal(observedPayloads.length, 1);
+
+    // 验证投影占位符严格满足 pi-antigravity-bridge 的正则契约
+    const toolResultBlock = observedPayloads[0].prompt.find(b => b.type === 'text' && b.text.includes('id="agy_mcp_read_1"'));
+    assert.ok(toolResultBlock);
+    assert.match(toolResultBlock.text, /\n\[已归档 ctx:\/\/tool\/[a-f0-9]{16,64}\]/);
+
+    await session.prompt('/traffic-opt 统计');
+    const summary = JSON.parse(await readFile(join(directory, 'report/summary.json'), 'utf8'));
+    assert.equal(summary.request_count, 1);
+    const serialized = Buffer.from(JSON.stringify(observedPayloads[0]), 'utf8');
+    assert.equal(summary.total_upload_bytes, serialized.length);
+    const record = summary.requests[0];
+    assert.equal(record.api, api);
+    assert.equal(record.transport, 'acp-stdio');
+    assert.equal(record.endpoint, 'acp://antigravity-cli');
+    assert.equal(record.response_status, 200);
+    assert.equal(record.context_tokens, 30);
+    assert.ok(record.tool_bytes_projected > 0);
+    assert.equal(record.image_count, 2);
+    assert.ok(record.image_decoded_bytes < fixture.png.length * 2);
+    assert.deepEqual(new Set(summary.image_details.map(image => image.source_type)), new Set(['user image', 'toolResult/read image']));
+    assert.equal(record.json_payload_bytes, serialized.length);
+    assert.equal(record.json_payload_bytes, ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_call_bytes',
+      'tool_result_bytes', 'image_payload_bytes', 'tool_schema_bytes', 'other_bytes'].reduce((sum, key) => sum + record[key], 0));
+    assert.ok(manager.getBranch().some(entry => entry.message?.role === 'toolResult' && entry.message.content[0]?.text === fixture.text));
+  } finally {
+    if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
 });

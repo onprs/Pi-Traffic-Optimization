@@ -72,8 +72,11 @@ flowchart LR
 | `google-generative-ai` / `google-vertex` | `models/<模型>:streamGenerateContent` | fetch |
 | `bedrock-converse-stream` | `/model/<模型>/converse-stream` | Node HTTP/2、代理或强制 HTTP/1 |
 | `pi-messages` | `/messages` | fetch |
+| `antigravity-acp` | `acp://antigravity-cli` 与 `/mcp-result` | `before_provider_request` 直接载荷观测（`acp-stdio`）与活跃轮次宿主 MCP 工具结果回传（`acp-mcp-result`） |
 
-分类覆盖系统提示、用户及 assistant 文本、工具参数、工具结果、工具 schema 和图片。图片支持 data URL、Anthropic Base64 source、Google inlineData、Bedrock image bytes 和 Pi image block；远程图片 URL 不计为本次上传的 Base64。HTTP 端点不保存查询参数或 URL 凭据。
+分类覆盖系统提示、用户及 assistant 文本、工具参数、工具结果、工具 schema 和图片。图片支持 data URL、Anthropic Base64 source、Google inlineData、Bedrock image bytes、Pi image block 和 ACP prompt/resource 图片块；远程图片 URL 不计为本次上传的 Base64。HTTP 端点不保存查询参数或 URL 凭据。
+
+图片压缩率按本次实际出站载荷中的图片 SHA-256 精确匹配累加，适应有状态增量传输协议。在 `pi-antigravity-bridge` 的 `hybrid` / `agy-tools` 模式下，`agy_read`、`agy_edit`、`agy_write`、`agy_bash` 及带 `details.diffs` 的镜像工具纳入归档与工作状态追踪，`agy_edit`/`agy_write` 变更会自动失效对应本地文件版本缓存与历史 `read` 快照；`agy-tools` 模式停用 `context_recall` 时自动跳过上下文投影并清理旧投影压力估算，图片压缩与 `acp-stdio` 流量观测继续工作。多工具并发分摊产生的极小输入 token 切片会被上下文校准器忽略。
 
 fetch 支持字符串、URL、Request，以及字符串、二进制或 Blob 正文。`gzip`、`deflate`、`br` 和 `zstd` 正文按实际压缩字节计入累计上传，分类使用解压后的 JSON。单次解压上限为 256 MiB；无法解码的正文跳过观测，原请求继续发送。每次重试分别记录实际请求与响应状态；assistant 完成后清除本次候选请求。
 
