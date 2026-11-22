@@ -389,3 +389,115 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('antigravity-acp 延迟大图投递（x-acp-mcp-images-deferred）防重计且精确计算压缩率', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-acp-deferred-'));
+  const report = join(dir, 'reports');
+  const previousEnv = {
+    PI_TRAFFIC_OPT_CONFIG_PATH: process.env.PI_TRAFFIC_OPT_CONFIG_PATH,
+    PI_TRAFFIC_OPT_REPORT_DIR: process.env.PI_TRAFFIC_OPT_REPORT_DIR,
+    PI_TRAFFIC_OPT_ARCHIVE_DIR: process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR,
+    PI_TRAFFIC_OPT_CACHE_DIR: process.env.PI_TRAFFIC_OPT_CACHE_DIR,
+  };
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = join(dir, 'config.json');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = report;
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  try {
+    // 生成 1 张高熵大图（压缩后仍 > 9,600B）与 1 张极小纯色图（<= 9,600B）
+    const width = 256;
+    const height = 256;
+    const noise = Buffer.alloc(width * height * 3);
+    for (let i = 0; i < noise.length; i++) noise[i] = (i * 73 + ((i >> 3) ^ (i * 17))) & 0xff;
+    const bigPng = await sharp(noise, { raw: { width, height, channels: 3 } }).png({ compressionLevel: 0 }).toBuffer();
+    const smallPng = await sharp({ create: { width: 4, height: 4, channels: 3, background: { r: 20, g: 180, b: 60 } } }).png().toBuffer();
+
+    const app = await harness({
+      model: { baseUrl: 'acp://antigravity-cli', provider: 'antigravity', id: 'gemini-4-neon', api: 'antigravity-acp', contextWindow: 1000000 },
+      activeTools: ['read', 'context_recall'],
+    });
+    await app.emit('session_start');
+
+    const messages = [
+      { role: 'user', content: '读取大小两张图片' },
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_img_mix', name: 'read', arguments: { path: 'mix.png' } }] },
+      {
+        role: 'toolResult',
+        toolCallId: 'agy_mcp_img_mix',
+        toolName: 'read',
+        isError: false,
+        content: [
+          { type: 'text', text: 'Read image files' },
+          { type: 'image', data: smallPng.toString('base64'), mimeType: 'image/png' },
+          { type: 'image', data: bigPng.toString('base64'), mimeType: 'image/png' },
+        ],
+      },
+    ];
+    const transformed = await app.emit('context_with_system', { messages });
+    const toolContent = transformed.messages[2].content;
+    const optSmall = toolContent[1];
+    const optBig = toolContent[2];
+    const smallOptBytes = Buffer.byteLength(optSmall.data, 'base64');
+    const bigOptBytes = Buffer.byteLength(optBig.data, 'base64');
+    assert.ok(smallOptBytes <= 9600, `小图应 <= 9600B，实际=${smallOptBytes}`);
+    assert.ok(bigOptBytes > 9600, `大图压缩后仍应 > 9600B 以触发延迟投递，实际=${bigOptBytes}`);
+
+    // 1. 宿主 MCP 结算：携带 x-acp-mcp-images-deferred: "9600"，acp-mcp-result 应仅计入小图、排除大图
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: {
+        'x-acp-session-id': 'agy-deferred-1',
+        'x-acp-transport': 'acp-mcp-result',
+        'x-acp-settled-mcp-ids': 'agy_mcp_img_mix',
+        'x-acp-projection-synced': '1',
+        'x-acp-mcp-images-deferred': '9600',
+      },
+    });
+
+    // 2. 紧随其后的同会话多模态 session/prompt 投递大图
+    app.emit('before_provider_request', {
+      payload: {
+        sessionId: 'agy-deferred-1',
+        prompt: [
+          { type: 'text', text: '<tool_result id="agy_mcp_img_mix" tool="read" status="ok">\n[Attached 1 image(s) from tool "read" delivered via multimodal prompt]\n</tool_result>' },
+          { type: 'image', data: optBig.data, mimeType: optBig.mimeType },
+          { type: 'text', text: 'Please inspect the attached tool result image(s) above and continue.' },
+        ],
+      },
+    });
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: { 'x-acp-session-id': 'agy-deferred-1', 'x-acp-projection-synced': '1' },
+    });
+    await app.emit('message_end', {
+      message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 2000, cacheRead: 1000, cacheWrite: 0 } },
+    });
+    await app.emit('agent_settled');
+
+    const summary = JSON.parse(await readFile(join(report, 'summary.json'), 'utf8'));
+    assert.equal(summary.request_count, 2);
+    assert.deepEqual(summary.requests.map((r) => r.transport), ['acp-mcp-result', 'acp-stdio']);
+    assert.equal(summary.requests[0].image_count, 1, 'acp-mcp-result 应仅计入未延迟的小图');
+    assert.equal(summary.requests[0].image_decoded_bytes, smallOptBytes);
+    assert.equal(summary.requests[1].image_count, 1, 'acp-stdio 应计入延迟投递的大图');
+    assert.equal(summary.requests[1].image_decoded_bytes, bigOptBytes);
+    assert.equal(summary.image_occurrences, 2, '总图片出现次数不得重复计入延迟大图');
+    assert.equal(summary.image_decoded_bytes, smallOptBytes + bigOptBytes);
+    assert.deepEqual(
+      summary.image_details.map((d) => ({ source: d.source_type, tool: d.tool_name, bytes: d.decoded_bytes })),
+      [
+        { source: 'toolResult/read image', tool: 'read', bytes: smallOptBytes },
+        { source: 'toolResult/read image', tool: 'read', bytes: bigOptBytes },
+      ],
+    );
+    const expectedSavedPct = (((bigPng.length + smallPng.length) - (bigOptBytes + smallOptBytes)) / (bigPng.length + smallPng.length) * 100).toFixed(1);
+    assert.ok(app.statuses.at(-1)?.includes(`图片压缩率 ${expectedSavedPct}%`), `状态栏压缩率应为 ${expectedSavedPct}%，实际: ${app.statuses.at(-1)}`);
+    await app.emit('session_shutdown');
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});

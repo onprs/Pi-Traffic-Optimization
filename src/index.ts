@@ -462,9 +462,21 @@ export default async function (pi: ExtensionAPI) {
           const settledIds = settledHeader
             ? new Set(settledHeader.split(',').map((item) => item.trim()).filter(Boolean))
             : undefined;
-          const toolResults = settledIds?.size
+          const deferredLimitHeader = readResponseHeader(event.headers, 'x-acp-mcp-images-deferred');
+          const deferredImageLimit = deferredLimitHeader && /^\d+$/.test(deferredLimitHeader.trim())
+            ? Number.parseInt(deferredLimitHeader.trim(), 10)
+            : null;
+          const rawToolResults = settledIds?.size
             ? continuation.payload.toolResults.filter((item: any) => settledIds.has(item.toolCallId))
             : continuation.payload.toolResults;
+          // 若桥接层将超过阈值的大图片延迟至紧随其后的多模态 session/prompt 投递，则 MCP 回传记录排除这些图片，避免重复统计。
+          const toolResults = deferredImageLimit !== null
+            ? rawToolResults.map((item: any) => ({
+                ...item,
+                content: (item.content ?? []).filter((block: any) =>
+                  block?.type !== 'image' || typeof block.data !== 'string' || Buffer.byteLength(block.data, 'base64') <= deferredImageLimit),
+              }))
+            : rawToolResults;
           if (toolResults.length > 0) {
             const body = JSON.stringify({ toolResults });
             const wireBytes = Buffer.byteLength(body, 'utf8');

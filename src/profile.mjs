@@ -373,11 +373,13 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
             const queue = sourceImages.get(item.data);
             let preferredSource = 'user image';
             if (activeResult) {
-              if (queue?.[0]?.source === 'user image') {
+              const expectedToolSource = isReadToolName(activeResult.tool_name) ? 'toolResult/read image' : 'toolResult/other';
+              const hasPendingExpectedToolSource = Boolean(queue?.some((entry) => entry.source === expectedToolSource));
+              if (!hasPendingExpectedToolSource && queue?.some((entry) => entry.source === 'user image')) {
                 activeResult = undefined;
                 preferredSource = 'user image';
               } else {
-                preferredSource = isReadToolName(activeResult.tool_name) ? 'toolResult/read image' : 'toolResult/other';
+                preferredSource = expectedToolSource;
               }
             }
             const beforeImage = parts.image_payload_bytes;

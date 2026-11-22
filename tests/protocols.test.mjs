@@ -228,4 +228,31 @@ test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、
     toolResults: [{ toolCallId: 'agy_mcp_2', toolName: 'read', isError: false, content: [{ type: 'image', data, mimeType: 'image/png' }] }],
   }, reversedContext);
   assert.equal(mcpImageMetrics.images[0].source_type, 'toolResult/read image');
+
+  // 延迟多模态切入的 <tool_result> + 多张同 base64 图片：即便历史首条为同 base64 user image，仍准确归属 toolResult/read image，随后才切回 user image
+  const repeatedSameImgContext = sourcesFromContext([
+    { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+    { role: 'toolResult', toolCallId: 'agy_mcp_3', toolName: 'read', content: [{ type: 'image', data, mimeType: 'image/png' }, { type: 'image', data, mimeType: 'image/png' }] },
+    { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+  ]);
+  const deferredMultiImgMetrics = analyzePayload('antigravity-acp', {
+    sessionId: 'agy-session-deferred',
+    prompt: [
+      { type: 'text', text: '<tool_result id="agy_mcp_3" tool="read" status="ok">\n[Attached 2 image(s) from tool "read" delivered via multimodal prompt]\n</tool_result>' },
+      { type: 'image', data, mimeType: 'image/png' },
+      { type: 'image', data, mimeType: 'image/png' },
+      { type: 'image', data, mimeType: 'image/png' },
+      { type: 'text', text: 'Please inspect the attached tool result image(s) above and continue.' },
+    ],
+  }, repeatedSameImgContext);
+  assert.deepEqual(
+    deferredMultiImgMetrics.images.map((image) => image.source_type),
+    ['toolResult/read image', 'toolResult/read image', 'user image'],
+  );
+  assert.deepEqual(
+    deferredMultiImgMetrics.images.map((image) => image.tool_name),
+    ['read', 'read', ''],
+  );
+  assert.equal(deferredMultiImgMetrics.results.length, 1);
+  assert.equal(deferredMultiImgMetrics.results[0].image_bytes, data.length * 2);
 });
