@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -492,6 +493,160 @@ test('antigravity-acp 延迟大图投递（x-acp-mcp-images-deferred）防重计
     );
     const expectedSavedPct = (((bigPng.length + smallPng.length) - (bigOptBytes + smallOptBytes)) / (bigPng.length + smallPng.length) * 100).toFixed(1);
     assert.ok(app.statuses.at(-1)?.includes(`图片压缩率 ${expectedSavedPct}%`), `状态栏压缩率应为 ${expectedSavedPct}%，实际: ${app.statuses.at(-1)}`);
+    await app.emit('session_shutdown');
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('antigravity-acp 上游全量快照（acp-upstream）替换本地增量、防切片重计、支持切入抢跑与无快照回退', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-acp-upstream-'));
+  const report = join(dir, 'reports');
+  const previousEnv = {
+    PI_TRAFFIC_OPT_CONFIG_PATH: process.env.PI_TRAFFIC_OPT_CONFIG_PATH,
+    PI_TRAFFIC_OPT_REPORT_DIR: process.env.PI_TRAFFIC_OPT_REPORT_DIR,
+    PI_TRAFFIC_OPT_ARCHIVE_DIR: process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR,
+    PI_TRAFFIC_OPT_CACHE_DIR: process.env.PI_TRAFFIC_OPT_CACHE_DIR,
+  };
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = join(dir, 'config.json');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = report;
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  await writeFile(process.env.PI_TRAFFIC_OPT_CONFIG_PATH, JSON.stringify({ enabled: true, skipBelowKB: 0, cache: { enabled: false }, logging: 'off' }));
+  try {
+    const raw = Buffer.alloc(240 * 240 * 3);
+    for (let i = 0; i < raw.length; i++) raw[i] = (i * 53 + ((i >> 2) ^ (i * 19))) & 0xff;
+    const pngImg = await sharp(raw, { raw: { width: 240, height: 240, channels: 3 } }).png({ compressionLevel: 0 }).toBuffer();
+
+    const app = await harness({
+      model: { baseUrl: 'acp://antigravity-cli', provider: 'antigravity', id: 'gemini-4-neon', api: 'antigravity-acp', contextWindow: 1000000 },
+      activeTools: ['read', 'bash', 'context_recall'],
+    });
+    await app.emit('session_start');
+
+    // 轮次 1：发送大图（本地增量仅 ~60KB，真实上游全量快照 200KB）；x-acp-upstream-pending=1 暂不记本地增量，由 acp-upstream 一次性落账
+    const msg1 = [{ role: 'user', content: [{ type: 'text', text: '分析这张图' }, { type: 'image', data: pngImg.toString('base64'), mimeType: 'image/png' }] }];
+    const out1 = await app.emit('context_with_system', { messages: msg1 });
+    const optImg = out1.messages[0].content[1];
+    const optBytes = Buffer.byteLength(optImg.data, 'base64');
+    const optB64Bytes = optImg.data.length;
+    const optHash = createHash('sha256').update(optImg.data, 'base64').digest('hex');
+
+    const statusCountBefore = app.statuses.length;
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-up-1', prompt: [{ type: 'text', text: '分析这张图' }, { type: 'image', data: optImg.data, mimeType: optImg.mimeType }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-projection-synced': '1', 'x-acp-upstream-pending': '1' } });
+    assert.equal(app.statuses.length, statusCountBefore, '收到 x-acp-upstream-pending=1 后在 acp-upstream 到达前不应先落本地增量假账');
+
+    const snap1 = {
+      genIdx: 0,
+      total_payload_bytes: 200000 + optB64Bytes,
+      json_payload_bytes: 200000 + optB64Bytes,
+      system_bytes: 30000,
+      user_text_bytes: 1000,
+      assistant_text_bytes: 0,
+      tool_call_bytes: 0,
+      tool_result_bytes: 150000,
+      image_payload_bytes: optB64Bytes,
+      image_decoded_bytes: optBytes,
+      tool_schema_bytes: 15000,
+      opaque_reasoning_bytes: 0,
+      other_bytes: 4000,
+      text_content_utf8_bytes: 181000,
+      image_count: 1,
+      images: [{ image_hash: optHash, mime_type: 'image/webp', decoded_bytes: optBytes, base64_bytes: optB64Bytes, image_payload_bytes: optB64Bytes, source_type: 'user image', tool_name: '' }],
+      results: [],
+    };
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: {
+        'x-acp-session-id': 'agy-up-1',
+        'x-acp-transport': 'acp-upstream',
+        'x-acp-projection-synced': '1',
+        'x-acp-upstream-gen-count': '1',
+        'x-acp-upstream-snapshot': JSON.stringify(snap1),
+      },
+    });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse', usage: { input: 5000, cacheRead: 40000, cacheWrite: 0 } } });
+    assert.ok(app.statuses.at(-1)?.includes(`当前 ${asMiB(snap1.total_payload_bytes)}`), `状态栏当前应显示上游全量: ${app.statuses.at(-1)}`);
+
+    // 轮次 2：同一次生成的第 2 个顺序工具（x-acp-transport=acp-upstream-reused），不得重复累加外网流量
+    const msg2 = [
+      { role: 'user', content: '历史图片已被归档，仅纯文本追问' },
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_seq_1', name: 'bash', arguments: { command: 'echo ok' } }] },
+      { role: 'toolResult', toolCallId: 'agy_mcp_seq_1', toolName: 'bash', isError: false, content: [{ type: 'text', text: 'ok' }] },
+    ];
+    await app.emit('context_with_system', { messages: msg2 });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-transport': 'acp-mcp-result', 'x-acp-settled-mcp-ids': 'agy_mcp_seq_1', 'x-acp-upstream-pending': '1' } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-transport': 'acp-upstream-reused', 'x-acp-projection-synced': '1' } });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse', usage: { input: 100, cacheRead: 900, cacheWrite: 0 } } });
+
+    // 轮次 3：工具边界切入（先收到 x-acp-mcp-cutin=1 + x-acp-upstream-pending=1 跳过本地占位，再收到抢跑取消的 detached 499，再收到真实全量 1.05MiB 且仍含已缓存优化图）
+    await app.emit('context_with_system', { messages: [...msg2, { role: 'user', content: '切入继续' }] });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-transport': 'acp-mcp-result', 'x-acp-settled-mcp-ids': 'agy_mcp_seq_1', 'x-acp-mcp-cutin': '1', 'x-acp-upstream-pending': '1' } });
+    const detachedSnap = {
+      genIdx: 1,
+      total_payload_bytes: 12000,
+      json_payload_bytes: 12000,
+      system_bytes: 2000, user_text_bytes: 500, assistant_text_bytes: 500, tool_call_bytes: 500,
+      tool_result_bytes: 500, image_payload_bytes: 0, image_decoded_bytes: 0, tool_schema_bytes: 7000,
+      opaque_reasoning_bytes: 0, other_bytes: 1000, text_content_utf8_bytes: 4000, image_count: 0, images: [], results: [],
+    };
+    app.emit('after_provider_response', {
+      status: 499,
+      headers: {
+        'x-acp-session-id': 'agy-up-1',
+        'x-acp-transport': 'acp-upstream',
+        'x-acp-upstream-detached': '1',
+        'x-acp-upstream-gen-count': '1',
+        'x-acp-upstream-snapshot': JSON.stringify(detachedSnap),
+      },
+    });
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-up-1', prompt: [{ type: 'text', text: '切入继续' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-projection-synced': '1', 'x-acp-upstream-pending': '1' } });
+    const snap3 = {
+      ...snap1,
+      genIdx: 2,
+      total_payload_bytes: 1100000 + optB64Bytes,
+      json_payload_bytes: 1100000 + optB64Bytes,
+      tool_result_bytes: 1050000,
+    };
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: {
+        'x-acp-session-id': 'agy-up-1',
+        'x-acp-transport': 'acp-upstream',
+        'x-acp-projection-synced': '1',
+        'x-acp-upstream-gen-count': '1',
+        'x-acp-upstream-snapshot': JSON.stringify(snap3),
+      },
+    });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 6000, cacheRead: 280000, cacheWrite: 0 } } });
+
+    // 即使轮次 3 的 context_with_system 不再包含原图，knownImageMetrics 仍准确维持原图压缩率
+    const expectedPct = (((pngImg.length - optBytes) / pngImg.length) * 100).toFixed(1);
+    assert.ok(app.statuses.at(-1)?.includes(`当前 ${asMiB(snap3.total_payload_bytes)}`), `状态栏当前应为 ~1.05MiB: ${app.statuses.at(-1)}`);
+    assert.ok(app.statuses.at(-1)?.includes(`图片压缩率 ${expectedPct}%`), `跨轮重传已归档优化图仍应维持准确压缩率 ${expectedPct}%，实际: ${app.statuses.at(-1)}`);
+
+    // 轮次 4：acp-upstream-unavailable 应平滑回退至本地 acp-stdio 记账
+    await app.emit('context_with_system', { messages: [{ role: 'user', content: '无快照回退' }] });
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-up-2', prompt: [{ type: 'text', text: '无快照回退' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-2', 'x-acp-upstream-pending': '1' } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-2', 'x-acp-transport': 'acp-upstream-unavailable' } });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 100, cacheRead: 0, cacheWrite: 0 } } });
+    await app.emit('agent_settled');
+
+    const summary = JSON.parse(await readFile(join(report, 'summary.json'), 'utf8'));
+    assert.equal(summary.request_count, 4, '应精准记录 1 次首轮 + 1 次 detached 499 + 1 次切入全量 + 1 次回退 acp-stdio（不含 reused 与 cutin 占位）');
+    assert.deepEqual(summary.requests.map((r) => r.transport), ['acp-upstream', 'acp-upstream', 'acp-upstream', 'acp-stdio']);
+    assert.deepEqual(summary.requests.map((r) => r.response_status), [200, 499, 200, 200]);
+    assert.deepEqual(summary.requests.map((r) => r.context_tokens), [45000, null, 286000, 100]);
+    assert.equal(summary.unique_images, 1);
+    assert.equal(summary.image_occurrences, 2);
+    assert.equal(summary.repeated_occurrences, 1);
     await app.emit('session_shutdown');
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {

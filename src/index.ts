@@ -43,18 +43,20 @@ export default async function (pi: ExtensionAPI) {
   let sentImageBytes = 0;
   const seen = new Set<string>();
   const hashes = new Map<string, string>();
+  const knownImageMetrics = new Map<string, { originalBytes: number; optimizedBytes: number }>();
   const waiting: any[] = [];
   let context: ReturnType<typeof sourcesFromContext> | undefined;
   let imageStats: { originalBytes: number; optimizedBytes: number } | undefined;
   let imageMetrics: Map<string, { originalBytes: number; optimizedBytes: number }> | undefined;
   let reusedRecallImageHashes: Set<string> | undefined;
+  let lastDirectMeta: any;
   let candidate: any;
-  let pendingDirectRecord: any;
+  let pendingAcpDirect: any;
+  let pendingAcpUpstreamFallback: any;
   let pendingAcpContinuation: any;
   let pendingAcpGc = false;
   let acpProjectionDesynced = false;
   let lastAcpSessionId: string | undefined;
-  let lastAcpRequestState: { prevSessionId: string | undefined; prevDesynced: boolean; record: any } | undefined;
   let stopObservation: (() => void) | undefined;
 
   const resetTransientState = () => {
@@ -62,14 +64,15 @@ export default async function (pi: ExtensionAPI) {
     imageStats = undefined;
     imageMetrics = undefined;
     reusedRecallImageHashes = undefined;
+    lastDirectMeta = undefined;
     projectionStats = undefined;
     candidate = undefined;
-    pendingDirectRecord = undefined;
+    pendingAcpDirect = undefined;
+    pendingAcpUpstreamFallback = undefined;
     pendingAcpContinuation = undefined;
     pendingAcpGc = false;
     acpProjectionDesynced = false;
     lastAcpSessionId = undefined;
-    lastAcpRequestState = undefined;
     waiting.length = 0;
   };
 
@@ -95,6 +98,7 @@ export default async function (pi: ExtensionAPI) {
     registerRecall();
     if (!next) {
       resetTransientState();
+      knownImageMetrics.clear();
     } else {
       installObservation();
     }
@@ -135,14 +139,14 @@ export default async function (pi: ExtensionAPI) {
     uploadedBytes += record.total_payload_bytes;
     currentBytes = record.total_payload_bytes;
     if (result.image_count > 0) {
-      if (request.imageMetrics?.size) {
+      if (request.imageMetrics?.size || knownImageMetrics.size) {
         for (const image of result.images) {
           if (image.tool_name === 'context_recall' && request.reusedImageHashes?.has(image.image_hash)) {
             originalImageBytes += image.decoded_bytes;
             sentImageBytes += image.decoded_bytes;
             continue;
           }
-          const matched = request.imageMetrics.get(image.image_hash);
+          const matched = request.imageMetrics?.get(image.image_hash) ?? knownImageMetrics.get(image.image_hash);
           originalImageBytes += matched?.originalBytes ?? image.decoded_bytes;
           sentImageBytes += matched?.optimizedBytes ?? image.decoded_bytes;
         }
@@ -154,6 +158,125 @@ export default async function (pi: ExtensionAPI) {
     save();
     updateStatus(request.ui);
     return record;
+  };
+
+  // 将桥接层从只读本地会话快照还原的真实上游全量请求统计记入流量报告与状态栏。
+  const recordUpstreamSnapshot = ({
+    snapshot, meta, status = 200, enqueueWaiting = true,
+  }: { snapshot: any; meta: any; status?: number | null; enqueueWaiting?: boolean }) => {
+    const started = performance.now();
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+    const system_bytes = num(snapshot.system_bytes);
+    const user_text_bytes = num(snapshot.user_text_bytes);
+    const assistant_text_bytes = num(snapshot.assistant_text_bytes);
+    const tool_call_bytes = num(snapshot.tool_call_bytes);
+    const tool_result_bytes = num(snapshot.tool_result_bytes);
+    const image_payload_bytes = num(snapshot.image_payload_bytes);
+    const image_decoded_bytes = num(snapshot.image_decoded_bytes);
+    const tool_schema_bytes = num(snapshot.tool_schema_bytes);
+    const opaque_reasoning_bytes = num(snapshot.opaque_reasoning_bytes);
+    const other_bytes = num(snapshot.other_bytes);
+    const sumParts = system_bytes + user_text_bytes + assistant_text_bytes + tool_call_bytes +
+      tool_result_bytes + image_payload_bytes + tool_schema_bytes + other_bytes;
+    const total_payload_bytes = Math.max(sumParts, num(snapshot.total_payload_bytes));
+    const json_payload_bytes = Math.max(sumParts, num(snapshot.json_payload_bytes) || total_payload_bytes);
+    const adjustedOther = other_bytes + Math.max(0, json_payload_bytes - sumParts);
+    const images = (Array.isArray(snapshot.images) ? snapshot.images : [])
+      .filter((img: any) => img && typeof img.image_hash === 'string' && typeof img.mime_type === 'string')
+      .map((img: any) => {
+        const repeated = seen.has(img.image_hash);
+        seen.add(img.image_hash);
+        const decoded = num(img.decoded_bytes);
+        const b64 = num(img.base64_bytes) || Math.ceil(decoded / 3) * 4;
+        return {
+          image_hash: img.image_hash,
+          mime_type: img.mime_type,
+          decoded_bytes: decoded,
+          base64_bytes: b64,
+          image_payload_bytes: num(img.image_payload_bytes) || b64,
+          source_type: typeof img.source_type === 'string' ? img.source_type : 'unknown',
+          repeated,
+          tool_name: typeof img.tool_name === 'string' ? img.tool_name : '',
+        };
+      });
+    const results = (Array.isArray(snapshot.results) ? snapshot.results : [])
+      .filter((item: any) => item && typeof item.tool_name === 'string')
+      .map((item: any) => ({
+        tool_name: item.tool_name,
+        text_bytes: num(item.text_bytes),
+        image_bytes: num(item.image_bytes),
+      }));
+
+    const record = {
+      timestamp: new Date().toISOString(), request_id: reporter.count + 1,
+      tool_bytes_projected: meta?.projectionStats?.toolBytesProjected ?? 0,
+      image_blocks_projected: meta?.projectionStats?.imageBlocksProjected ?? 0,
+      image_bytes_avoided: meta?.projectionStats?.imageBytesAvoided ?? 0,
+      projection_ms: meta?.projectionStats?.projectionMs ?? 0,
+      provider: meta?.provider ?? 'antigravity',
+      model: meta?.model ?? 'unknown',
+      api: meta?.api ?? 'antigravity-acp',
+      endpoint: meta?.baseUrl || 'acp://antigravity-cli',
+      transport: 'acp-upstream',
+      context_tokens: null,
+      estimated_context_tokens: meta?.estimated_context_tokens ?? null,
+      candidate_payload_bytes: total_payload_bytes,
+      text_bytes: user_text_bytes + assistant_text_bytes,
+      content_encoding: '',
+      content_length: null,
+      response_status: status,
+      download_bytes: null,
+      system_bytes, user_text_bytes, assistant_text_bytes, tool_call_bytes, tool_result_bytes,
+      image_payload_bytes, image_decoded_bytes, tool_schema_bytes,
+      other_bytes: adjustedOther, opaque_reasoning_bytes,
+      text_content_utf8_bytes: num(snapshot.text_content_utf8_bytes),
+      image_count: images.length,
+      images,
+      results,
+      json_payload_bytes,
+      total_payload_bytes,
+      profile_ms: Math.round((performance.now() - started) * 10) / 10,
+    };
+    reporter.add(record);
+    if (enqueueWaiting) {
+      waiting.length = 0;
+      waiting.push(record);
+    }
+    uploadedBytes += record.total_payload_bytes;
+    currentBytes = record.total_payload_bytes;
+    if (images.length > 0) {
+      for (const image of images) {
+        if (image.tool_name === 'context_recall' && meta?.reusedImageHashes?.has(image.image_hash)) {
+          originalImageBytes += image.decoded_bytes;
+          sentImageBytes += image.decoded_bytes;
+          continue;
+        }
+        const matched = meta?.imageMetrics?.get(image.image_hash) ?? knownImageMetrics.get(image.image_hash);
+        originalImageBytes += matched?.originalBytes ?? image.decoded_bytes;
+        sentImageBytes += matched?.optimizedBytes ?? image.decoded_bytes;
+      }
+    }
+    save();
+    updateStatus(meta?.ui);
+    return record;
+  };
+
+  const commitPendingAcpFallback = (statusOverride?: number | null) => {
+    const item = pendingAcpUpstreamFallback ?? pendingAcpDirect;
+    pendingAcpUpstreamFallback = undefined;
+    pendingAcpDirect = undefined;
+    if (!item) return undefined;
+    const status = statusOverride !== undefined ? statusOverride : (item.initialStatus ?? null);
+    return recordRequest({
+      request: item.request,
+      endpoint: item.endpoint,
+      headers: new Headers(),
+      body: item.body,
+      wireBytes: item.wireBytes,
+      transport: item.transport,
+      initialStatus: status,
+      enqueueWaiting: !item.isAux,
+    });
   };
 
   // 收集本次消息上下文中由 context_recall 复用的已优化图片哈希，避免重复计入图片压缩率统计。
@@ -331,19 +454,33 @@ export default async function (pi: ExtensionAPI) {
       imageStats = stats;
       imageMetrics = pairs;
       reusedRecallImageHashes = collectReusedRecallImageHashes(messages);
+      for (const [imgHash, pair] of pairs.entries()) {
+        if (knownImageMetrics.has(imgHash) && reusedRecallImageHashes.has(imgHash) && pair.originalBytes === pair.optimizedBytes) {
+          continue;
+        }
+        knownImageMetrics.set(imgHash, pair);
+      }
+      while (knownImageMetrics.size > 256) {
+        const oldest = knownImageMetrics.keys().next().value;
+        if (oldest === undefined) break;
+        knownImageMetrics.delete(oldest);
+      }
       context = sourcesFromContext(messages);
       if (isDirectModel) {
+        lastDirectMeta = {
+          reusedImageHashes: reusedRecallImageHashes,
+          context, imageStats: stats, imageMetrics: pairs, projectionStats,
+          provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
+          api: ctx.model.api, baseUrl: ctx.model.baseUrl,
+          estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
+          ui: ctx.hasUI ? ctx.ui : undefined,
+        };
         const { results: toolResults, hasTrailingUser } = extractAcpMcpToolResults(messages);
         if (toolResults.length > 0) {
           pendingAcpContinuation = {
+            ...lastDirectMeta,
             payload: { toolResults },
             hasTrailingUser,
-            reusedImageHashes: reusedRecallImageHashes,
-            context, imageStats: stats, imageMetrics: pairs, projectionStats,
-            provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
-            api: ctx.model.api, baseUrl: ctx.model.baseUrl,
-            estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
-            ui: ctx.hasUI ? ctx.ui : undefined,
           };
         }
       }
@@ -358,6 +495,9 @@ export default async function (pi: ExtensionAPI) {
   });
   pi.on('agent_settled', async (_event, ctx) => {
     if (!enabled) return;
+    if (pendingAcpUpstreamFallback || pendingAcpDirect) {
+      commitPendingAcpFallback();
+    }
     try { await optimizer.sweep(memory.config); } catch { /* 清理失败不影响对话。 */ }
     try { await memory.maintain(); } catch { memory.metrics.failures++; }
     reporter.changed();
@@ -394,9 +534,12 @@ export default async function (pi: ExtensionAPI) {
   });
   pi.on('before_provider_request', (event, ctx) => {
     if (!enabled) return;
+    if (pendingAcpUpstreamFallback || pendingAcpDirect) {
+      commitPendingAcpFallback();
+    }
     candidate = undefined;
-    pendingDirectRecord = undefined;
-    lastAcpRequestState = undefined;
+    pendingAcpDirect = undefined;
+    pendingAcpUpstreamFallback = undefined;
     pendingAcpContinuation = undefined;
     waiting.length = 0;
     try {
@@ -425,26 +568,32 @@ export default async function (pi: ExtensionAPI) {
           acpProjectionDesynced = false;
         }
         if (nextSessionId) lastAcpSessionId = nextSessionId;
-        pendingDirectRecord = recordRequest({
+        lastDirectMeta = request;
+        // 先暂存直接载荷，待 after_provider_response 确认是否由 acp-upstream 全量快照接管或立即按 acp-stdio 落账。
+        pendingAcpDirect = {
           request,
           endpoint: model.baseUrl || 'acp://antigravity-cli',
-          headers: new Headers(),
           body,
           wireBytes,
           transport: 'acp-stdio',
-        });
-        lastAcpRequestState = { prevSessionId, prevDesynced, record: pendingDirectRecord };
+          initialStatus: null,
+          isAux: false,
+          prevSessionId,
+          prevDesynced,
+        };
       } else {
         candidate = request;
       }
-    } catch { candidate = undefined; pendingDirectRecord = undefined; lastAcpRequestState = undefined; }
+    } catch { candidate = undefined; pendingAcpDirect = undefined; pendingAcpUpstreamFallback = undefined; }
     finally { context = undefined; imageStats = undefined; imageMetrics = undefined; reusedRecallImageHashes = undefined; projectionStats = undefined; }
   });
   pi.on('after_provider_response', (event) => {
     if (!enabled) return;
     try {
       const acpTransport = readResponseHeader(event.headers, 'x-acp-transport');
-      if (acpTransport === 'acp-mcp-result') {
+      const isAux = readResponseHeader(event.headers, 'x-acp-auxiliary') === '1';
+      const applyProjectionHeader = () => {
+        if (isAux) return;
         const sessionId = readResponseHeader(event.headers, 'x-acp-session-id');
         if (sessionId) lastAcpSessionId = sessionId;
         const projectionSynced = readResponseHeader(event.headers, 'x-acp-projection-synced');
@@ -455,8 +604,69 @@ export default async function (pi: ExtensionAPI) {
           acpProjectionDesynced = true;
           pendingAcpGc = false;
         }
+      };
+
+      if (acpTransport === 'acp-upstream') {
+        const isDetached = readResponseHeader(event.headers, 'x-acp-upstream-detached') === '1';
+        if (!isDetached) applyProjectionHeader();
+        const rawSnapshot = readResponseHeader(event.headers, 'x-acp-upstream-snapshot');
+        const genCountRaw = readResponseHeader(event.headers, 'x-acp-upstream-gen-count');
+        const parsedGenCount = genCountRaw && /^\d+$/.test(genCountRaw.trim())
+          ? Math.min(10, Math.max(1, Number.parseInt(genCountRaw.trim(), 10)))
+          : 1;
+        let snapshot: any;
+        if (rawSnapshot) {
+          try { snapshot = JSON.parse(rawSnapshot); } catch { snapshot = undefined; }
+        }
+        const pendingMeta = isDetached
+          ? lastDirectMeta
+          : (pendingAcpUpstreamFallback?.request ?? pendingAcpDirect?.request ?? lastDirectMeta);
+        if (snapshot && typeof snapshot === 'object') {
+          if (!isDetached) {
+            pendingAcpUpstreamFallback = undefined;
+            pendingAcpDirect = undefined;
+            pendingAcpContinuation = undefined;
+          }
+          const status = typeof event.status === 'number' ? event.status : 200;
+          for (let g = 0; g < parsedGenCount; g++) {
+            const isFinalGen = g === parsedGenCount - 1;
+            recordUpstreamSnapshot({
+              snapshot,
+              meta: pendingMeta,
+              status: isFinalGen ? status : 200,
+              enqueueWaiting: !isDetached && isFinalGen && !isAux,
+            });
+          }
+        } else if (!isDetached) {
+          commitPendingAcpFallback(typeof event.status === 'number' ? event.status : 200);
+        }
+        return;
+      }
+
+      if (acpTransport === 'acp-upstream-reused') {
+        applyProjectionHeader();
+        pendingAcpUpstreamFallback = undefined;
+        pendingAcpDirect = undefined;
+        pendingAcpContinuation = undefined;
+        return;
+      }
+
+      if (acpTransport === 'acp-upstream-unavailable') {
+        applyProjectionHeader();
+        commitPendingAcpFallback(typeof event.status === 'number' ? event.status : 200);
+        return;
+      }
+
+      if (acpTransport === 'acp-mcp-result') {
+        applyProjectionHeader();
         const continuation = pendingAcpContinuation;
         pendingAcpContinuation = undefined;
+        const isCutIn = readResponseHeader(event.headers, 'x-acp-mcp-cutin') === '1';
+        const isUpstreamPending = readResponseHeader(event.headers, 'x-acp-upstream-pending') === '1';
+        if (isCutIn && isUpstreamPending) {
+          // 紧随其后的工具边界切入 session/prompt 会统一上报完整上游快照，跳过本次纯本地切入占位。
+          return;
+        }
         if (continuation) {
           const settledHeader = readResponseHeader(event.headers, 'x-acp-settled-mcp-ids');
           const settledIds = settledHeader
@@ -480,48 +690,64 @@ export default async function (pi: ExtensionAPI) {
           if (toolResults.length > 0) {
             const body = JSON.stringify({ toolResults });
             const wireBytes = Buffer.byteLength(body, 'utf8');
-            recordRequest({
-              request: { ...continuation, bytes: wireBytes },
-              endpoint: `${continuation.baseUrl || 'acp://antigravity-cli'}/mcp-result`,
-              headers: new Headers(),
-              body,
-              wireBytes,
-              transport: 'acp-mcp-result',
-              initialStatus: typeof event.status === 'number' ? event.status : 200,
-              enqueueWaiting: true,
-            });
+            const status = typeof event.status === 'number' ? event.status : 200;
+            if (isUpstreamPending) {
+              pendingAcpUpstreamFallback = {
+                request: { ...continuation, bytes: wireBytes },
+                endpoint: `${continuation.baseUrl || 'acp://antigravity-cli'}/mcp-result`,
+                body,
+                wireBytes,
+                transport: 'acp-mcp-result',
+                initialStatus: status,
+                isAux: false,
+              };
+            } else {
+              recordRequest({
+                request: { ...continuation, bytes: wireBytes },
+                endpoint: `${continuation.baseUrl || 'acp://antigravity-cli'}/mcp-result`,
+                headers: new Headers(),
+                body,
+                wireBytes,
+                transport: 'acp-mcp-result',
+                initialStatus: status,
+                enqueueWaiting: true,
+              });
+            }
           }
         }
         return;
       }
-      if (!pendingDirectRecord) return;
-      if (typeof event.status === 'number') {
-        pendingDirectRecord.response_status = event.status;
-        save(pendingDirectRecord);
-      }
-      const isAux = readResponseHeader(event.headers, 'x-acp-auxiliary') === '1';
-      if (isAux && lastAcpRequestState) {
-        const idx = waiting.indexOf(lastAcpRequestState.record);
-        if (idx >= 0) waiting.splice(idx, 1);
-        lastAcpSessionId = lastAcpRequestState.prevSessionId;
-        acpProjectionDesynced = lastAcpRequestState.prevDesynced;
+
+      if (!pendingAcpDirect) return;
+      const direct = pendingAcpDirect;
+      pendingAcpDirect = undefined;
+      if (isAux) {
+        lastAcpSessionId = direct.prevSessionId;
+        acpProjectionDesynced = direct.prevDesynced;
       } else {
-        const projectionSynced = readResponseHeader(event.headers, 'x-acp-projection-synced');
-        if (projectionSynced === '1') {
-          acpProjectionDesynced = false;
-          pendingAcpGc = false;
-        } else if (projectionSynced === '0') {
-          acpProjectionDesynced = true;
-          pendingAcpGc = false;
-        }
+        applyProjectionHeader();
+      }
+      const status = typeof event.status === 'number' ? event.status : 200;
+      const isUpstreamPending = readResponseHeader(event.headers, 'x-acp-upstream-pending') === '1';
+      if (isUpstreamPending) {
+        pendingAcpUpstreamFallback = {
+          ...direct,
+          initialStatus: status,
+          isAux,
+        };
+      } else {
+        recordRequest({
+          request: direct.request,
+          endpoint: direct.endpoint,
+          headers: new Headers(),
+          body: direct.body,
+          wireBytes: direct.wireBytes,
+          transport: direct.transport,
+          initialStatus: status,
+          enqueueWaiting: !isAux,
+        });
       }
     } catch { /* 只读观测。 */ }
-    finally {
-      if (readResponseHeader(event.headers, 'x-acp-transport') !== 'acp-mcp-result') {
-        pendingDirectRecord = undefined;
-        lastAcpRequestState = undefined;
-      }
-    }
   });
   pi.on('message_end', async (event) => {
     if (!enabled) return;
@@ -536,8 +762,14 @@ export default async function (pi: ExtensionAPI) {
       }
       memory.observeAssistantMessage(event.message, { skipCalibration: acpProjectionDesynced });
       candidate = undefined;
-      pendingDirectRecord = undefined;
-      lastAcpRequestState = undefined;
+      if (pendingAcpUpstreamFallback || pendingAcpDirect) {
+        if (event.message.stopReason === 'aborted') {
+          pendingAcpUpstreamFallback = undefined;
+          pendingAcpDirect = undefined;
+        } else {
+          commitPendingAcpFallback();
+        }
+      }
       const continuation = pendingAcpContinuation;
       pendingAcpContinuation = undefined;
       const usage = event.message.usage;
@@ -545,7 +777,7 @@ export default async function (pi: ExtensionAPI) {
       const record = waiting.shift();
       if (record) {
         record.context_tokens = contextTokens;
-        if (record.transport === 'acp-mcp-result' && event.message.stopReason === 'error') {
+        if ((record.transport === 'acp-mcp-result' || record.transport === 'acp-upstream') && event.message.stopReason === 'error') {
           const statusMatch = /\b([45]\d\d)\b/.exec(event.message.errorMessage ?? '');
           record.response_status = statusMatch ? Number(statusMatch[1]) : null;
         }
@@ -571,6 +803,7 @@ export default async function (pi: ExtensionAPI) {
     enabled = false;
     memory.config.enabled = false;
     resetTransientState();
+    knownImageMetrics.clear();
     try { await reporter.close(); } catch { /* 报告故障不能阻止退出。 */ }
     try { await memory.close(); } catch { /* 归档故障不能阻止退出。 */ }
     stopObservation?.();
