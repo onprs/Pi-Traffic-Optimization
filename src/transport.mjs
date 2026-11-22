@@ -1,6 +1,6 @@
 import { channel } from 'node:diagnostics_channel';
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from 'node:zlib';
-const { matchesProviderEndpoint } = await import(new URL('./profile.mjs' + new URL(import.meta.url).search, import.meta.url).href);
+const { resolveEndpointCandidate } = await import(new URL('./profile.mjs' + new URL(import.meta.url).search, import.meta.url).href);
 
 const asBuffer = (chunk, encoding) => typeof chunk === 'string' ? Buffer.from(chunk, encoding) :
   ArrayBuffer.isView(chunk) ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength) :
@@ -10,12 +10,20 @@ const decompressors = new Map([['gzip', gunzipSync], ['deflate', inflateSync], [
 
 export function observeRequests({ getCandidate, onRequest, onResponse }) {
   const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+  const originalWsSend = typeof originalWebSocket === 'function' && typeof originalWebSocket.prototype?.send === 'function'
+    ? originalWebSocket.prototype.send
+    : undefined;
+  const wsUrls = new WeakMap();
   const subscriptions = [];
   let active = true;
-  const target = (url, method, native = false) => {
+  let observedWebSocket;
+  let observedWsSend;
+  const target = (url, method, options = {}) => {
     const candidate = active && getCandidate();
-    if (!candidate || method?.toUpperCase() !== 'POST' || (native && candidate.api !== 'bedrock-converse-stream')) return;
-    return matchesProviderEndpoint(candidate, url) ? candidate : undefined;
+    if (!candidate) return;
+    if (!options.allowWebSocket && method?.toUpperCase() !== 'POST') return;
+    return resolveEndpointCandidate(candidate, url, options);
   };
   const observe = (candidate, url, headers, body, transport) => {
     if (!active || !getCandidate()) return;
@@ -67,6 +75,64 @@ export function observeRequests({ getCandidate, onRequest, onResponse }) {
   };
   globalThis.fetch = observedFetch;
 
+  const sendWithObservation = (socket, originalSend, args, data) => {
+    let matched;
+    let url;
+    let snapshot;
+    let isBlob = false;
+    if (active) {
+      try {
+        url = wsUrls.get(socket) ?? (typeof socket?.url === 'string' ? socket.url : '');
+        if (url) {
+          matched = target(url, undefined, { allowWebSocket: true });
+          if (matched) {
+            if (typeof data === 'string') snapshot = data;
+            else {
+              const buffer = asBuffer(data);
+              if (buffer) snapshot = Buffer.from(buffer);
+              else if (data instanceof Blob) isBlob = true;
+            }
+          }
+        }
+      } catch { /* 保持 WebSocket.send 的原参数与行为。 */ }
+    }
+    const result = originalSend.apply(socket, args);
+    if (matched) {
+      try {
+        if (snapshot !== undefined) observe(matched, url, new Headers(), snapshot, 'websocket');
+        else if (isBlob) void data.arrayBuffer().then(body => observe(matched, url, new Headers(), Buffer.from(body), 'websocket'), () => {});
+      } catch { /* 观测失败不影响已发送帧。 */ }
+    }
+    return result;
+  };
+
+  if (typeof originalWebSocket === 'function') {
+    if (originalWsSend) {
+      observedWsSend = function (data) {
+        return sendWithObservation(this, originalWsSend, arguments, data);
+      };
+      try { originalWebSocket.prototype.send = observedWsSend; } catch { observedWsSend = undefined; }
+    }
+    try {
+      observedWebSocket = new Proxy(originalWebSocket, {
+        construct(ctor, args, newTarget) {
+          const instance = Reflect.construct(ctor, args, newTarget === observedWebSocket ? ctor : newTarget);
+          try {
+            if (args[0] != null) wsUrls.set(instance, String(args[0]));
+            if ((Object.prototype.hasOwnProperty.call(instance, 'send') || !observedWsSend) && typeof instance.send === 'function') {
+              const ownSend = instance.send;
+              instance.send = function (data) {
+                return sendWithObservation(this, ownSend, arguments, data);
+              };
+            }
+          } catch { /* 保持 WebSocket 构造原行为。 */ }
+          return instance;
+        },
+      });
+      globalThis.WebSocket = observedWebSocket;
+    } catch { observedWebSocket = undefined; }
+  }
+
   const subscribe = (name, handler) => {
     const source = channel(name);
     const listener = (event) => { if (active) try { handler(event); } catch { /* diagnostics 回调不得抛错。 */ } };
@@ -76,7 +142,7 @@ export function observeRequests({ getCandidate, onRequest, onResponse }) {
   const streams = new WeakMap();
   subscribe('http2.client.stream.created', ({ stream, headers }) => {
     const url = `${headers[':scheme']}://${headers[':authority']}${headers[':path']}`;
-    const candidate = target(url, headers[':method'], true);
+    const candidate = target(url, headers[':method'], { native: true });
     if (!candidate) return;
     const regularHeaders = Object.entries(headers).filter(([key]) => !key.startsWith(':'));
     const state = { candidate, url, headers: new Headers(regularHeaders), chunks: [], record: undefined, status: undefined };
@@ -103,7 +169,7 @@ export function observeRequests({ getCandidate, onRequest, onResponse }) {
   // Bedrock 的代理或 HTTP/1 配置使用 ClientRequest；只包装已匹配的实例。
   subscribe('http.client.request.created', ({ request }) => {
     const url = new URL(request.path, `${request.protocol}//${request.getHeader('host')}`).href;
-    const candidate = target(url, request.method, true);
+    const candidate = target(url, request.method, { native: true });
     if (!candidate) return;
     const chunks = [];
     let valid = true;
@@ -136,5 +202,11 @@ export function observeRequests({ getCandidate, onRequest, onResponse }) {
     active = false;
     for (const unsubscribe of subscriptions) unsubscribe();
     if (globalThis.fetch === observedFetch) globalThis.fetch = originalFetch;
+    if (observedWsSend && originalWebSocket?.prototype?.send === observedWsSend) {
+      originalWebSocket.prototype.send = originalWsSend;
+    }
+    if (observedWebSocket && globalThis.WebSocket === observedWebSocket) {
+      globalThis.WebSocket = originalWebSocket;
+    }
   };
 }

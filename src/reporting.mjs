@@ -119,8 +119,8 @@ export class TrafficReporter {
       const s = this.summary();
       await this.atomic('summary.json', JSON.stringify(s, null, 2) + '\n');
       const lines = ['# Pi 流量与 Context Projection 观测', '',
-        '最终请求体大小为 measured，HTTP 覆盖 fetch、Node HTTP/1 与 HTTP/2（含重试及内容压缩），ACP 优先统计 antigravity-acp 从本地会话快照还原的上游全量请求（acp-upstream），不可用时回退统计 session/prompt 与宿主 MCP 工具结果回传。响应/TCP/TLS 字节未采集。',
-        '内容分类及图片占比按解压后的 JSON UTF-8 字节计算；json_payload_bytes 与压缩后的 total_payload_bytes 分别记录。WebSocket 未计量。',
+        '最终请求体大小为 measured，HTTP 覆盖 fetch、Node HTTP/1 与 HTTP/2（含重试及内容压缩），WebSocket 覆盖实际发送帧正文，ACP 优先统计 antigravity-acp 从本地会话快照还原的上游全量请求（acp-upstream），不可用时回退统计 session/prompt 与宿主 MCP 工具结果回传。响应/TCP/TLS 字节未采集。',
+        '内容分类及图片占比按解压后的 JSON UTF-8 字节计算；json_payload_bytes 与压缩后的 total_payload_bytes 分别记录。',
         'events.jsonl 是增量事实记录；requests.csv 的 request/update 行按 request_id 合并，update 不算新请求。摘要明细仅保留最近配置数量。',
         'tool 投影量是 context 文本 UTF-8 差；图片避免量是优化图片二进制的 counterfactual。未优化 HTTP 请求体不存在时，HTTP 节省值为 null。tokens 和 compact 压力指标为 estimated。', '',
         `请求 ${s.request_count}；累计 ${mib(s.total_upload_bytes)} MiB；均值 ${mib(s.average_bytes)} MiB；最大 ${mib(s.maximum_bytes)} MiB。`, '',

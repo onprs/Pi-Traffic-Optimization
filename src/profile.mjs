@@ -12,6 +12,8 @@ const families = new Map([
 
 // 使用非 HTTP 传输并通过 before_provider_request 直接交付出站载荷的协议。
 export const isDirectPayloadApi = (api) => families.get(api) === 'acp';
+export const VIRTUAL_MODEL_API = 'pi-virtual';
+export const isVirtualModelApi = (api) => api === VIRTUAL_MODEL_API;
 
 export function isProviderPayload(api, payload) {
   if (!payload || typeof payload !== 'object') return false;
@@ -25,16 +27,24 @@ export function isProviderPayload(api, payload) {
   }
 }
 
-// 只匹配当前模型所属的推理入口；查询参数、凭据和其他 HTTP 请求不进入报告。
-export function matchesProviderEndpoint(model, input) {
-  if (!families.has(model.api) || isDirectPayloadApi(model.api)) return false;
-  const url = new URL(input);
-  if (!['http:', 'https:'].includes(url.protocol)) return false;
+const protocolSchemeFamily = (protocol) => (protocol === 'https:' || protocol === 'wss:') ? 'tls'
+  : (protocol === 'http:' || protocol === 'ws:') ? 'plain' : protocol;
+
+// 只匹配当前模型所属的推理入口；查询参数、凭据和其他无关请求不进入报告。
+export function matchesProviderEndpoint(model, input, options = {}) {
+  if (!model || !families.has(model.api) || isDirectPayloadApi(model.api)) return false;
+  let url;
+  try { url = new URL(input); } catch { return false; }
+  const allowWebSocket = Boolean(options?.allowWebSocket);
+  const allowedProtocols = allowWebSocket ? ['http:', 'https:', 'ws:', 'wss:'] : ['http:', 'https:'];
+  if (!allowedProtocols.includes(url.protocol)) return false;
   let base;
   try { base = new URL(model.baseUrl); } catch { /* Vertex 的默认地址可能包含 {location}。 */ }
   const path = url.pathname.replace(/\/+$/, '');
   const root = base?.pathname.replace(/\/+$/, '') ?? '';
-  const sameOrigin = base?.origin === url.origin;
+  const sameOrigin = allowWebSocket
+    ? Boolean(base && base.host === url.host && protocolSchemeFamily(base.protocol) === protocolSchemeFamily(url.protocol))
+    : base?.origin === url.origin;
   const googleDefault = model.api === 'google-vertex' && (!base || base.hostname.includes('{location}')) &&
     /^(?:[a-z0-9-]+-)?aiplatform\.googleapis\.com$/.test(url.hostname);
   const bedrockDefault = model.api === 'bedrock-converse-stream' && base &&
@@ -54,7 +64,7 @@ export function matchesProviderEndpoint(model, input) {
     }
     case 'openai-completions': return path === `${root}/chat/completions`;
     case 'mistral-conversations': return path === `${root}/v1/chat/completions`;
-    case 'anthropic-messages': return path === `${root}/v1/messages`;
+    case 'anthropic-messages': return path === `${root}/v1/messages` || (root.endsWith('/v1') && path === `${root}/messages`);
     case 'pi-messages': return path === `${root}/messages`;
     case 'google-generative-ai': case 'google-vertex':
       return (googleDefault || path.startsWith(`${root}/`)) && /\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/.test(path);
@@ -62,6 +72,75 @@ export function matchesProviderEndpoint(model, input) {
       return path === `${root}/model/${encodeURIComponent(model.id)}/converse-stream`;
     default: return false;
   }
+}
+
+// 在虚拟模型路由场景下，根据出站载荷结构与已注册物理模型集合推断候选目标模型。
+export function inferCandidateModels(payload, knownModels = []) {
+  if (!payload || typeof payload !== 'object') return [];
+  const models = Array.isArray(knownModels)
+    ? knownModels.filter((item) => item && typeof item === 'object' && typeof item.api === 'string' && !isVirtualModelApi(item.api))
+    : [];
+  const requested = typeof payload.model === 'string' && payload.model.trim() ? payload.model.trim() : '';
+  if (isProviderPayload('antigravity-acp', payload)) {
+    const direct = models.filter((item) => isDirectPayloadApi(item.api));
+    if (requested) {
+      const exact = direct.filter((item) => item.id === requested || `${item.provider}/${item.id}` === requested);
+      if (exact.length > 0) return exact;
+    }
+    if (direct.length > 0) return direct;
+    return [{
+      provider: 'antigravity',
+      id: requested || 'unknown',
+      api: 'antigravity-acp',
+      baseUrl: 'acp://antigravity-cli',
+    }];
+  }
+  const matched = models.filter((item) => families.has(item.api) && !isDirectPayloadApi(item.api) && isProviderPayload(item.api, payload));
+  if (matched.length === 0) return [];
+  if (requested) {
+    const exact = matched.filter((item) => item.id === requested || `${item.provider}/${item.id}` === requested);
+    if (exact.length > 0) return exact;
+    const suffix = matched.filter((item) => item.id.endsWith(`/${requested}`) || requested.endsWith(`/${item.id}`));
+    if (suffix.length > 0) return suffix;
+  }
+  return matched;
+}
+
+// 根据实际出站 URL 匹配单个模型或从虚拟模型候选中反查精确物理模型。
+export function resolveEndpointCandidate(candidate, input, options = {}) {
+  if (!candidate) return undefined;
+  const native = Boolean(options?.native);
+  if (!Array.isArray(candidate.candidates)) {
+    if (native && candidate.api !== 'bedrock-converse-stream') return undefined;
+    return matchesProviderEndpoint(candidate, input, options) ? candidate : undefined;
+  }
+  const hits = candidate.candidates.filter((item) =>
+    (!native || item.api === 'bedrock-converse-stream') && matchesProviderEndpoint(item, input, options));
+  if (hits.length === 0) return undefined;
+  let selected = hits[0];
+  if (hits.length > 1) {
+    let urlModel = '';
+    try {
+      const pathname = new URL(input).pathname;
+      const googleMatch = /\/models\/([^/]+):(?:streamGenerateContent|generateContent)$/.exec(pathname);
+      if (googleMatch) urlModel = decodeURIComponent(googleMatch[1]);
+    } catch { /* 忽略无法解析的 URL。 */ }
+    const requested = urlModel || (typeof candidate.payloadModel === 'string' ? candidate.payloadModel : '');
+    if (requested) {
+      selected = hits.find((item) => item.id === requested || `${item.provider}/${item.id}` === requested)
+        ?? hits.find((item) => item.id.endsWith(`/${requested}`) || requested.endsWith(`/${item.id}`))
+        ?? hits[0];
+    }
+  }
+  return {
+    ...candidate,
+    provider: selected.provider,
+    model: selected.id,
+    id: selected.id,
+    api: selected.api,
+    baseUrl: selected.baseUrl,
+    inferredModel: true,
+  };
 }
 
 export function sourcesFromContext(messages) {

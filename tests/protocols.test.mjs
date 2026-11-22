@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { analyzePayload, isDirectPayloadApi, isProviderPayload, matchesProviderEndpoint, sourcesFromContext } from '../src/profile.mjs';
+import {
+  analyzePayload, inferCandidateModels, isDirectPayloadApi, isProviderPayload,
+  isVirtualModelApi, matchesProviderEndpoint, resolveEndpointCandidate, sourcesFromContext,
+} from '../src/profile.mjs';
 
 const data = Buffer.from('协议图片').toString('base64');
 const imageUrl = `data:image/png;base64,${data}`;
@@ -255,4 +258,62 @@ test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、
   );
   assert.equal(deferredMultiImgMetrics.results.length, 1);
   assert.equal(deferredMultiImgMetrics.results[0].image_bytes, data.length * 2);
+});
+
+test('WebSocket 端点、自定义 Anthropic /v1 端点及虚拟模型候选反查', () => {
+  const codex = { api: 'openai-codex-responses', id: 'gpt-5.4', baseUrl: 'https://chatgpt.com/backend-api' };
+  assert.equal(matchesProviderEndpoint(codex, 'wss://chatgpt.com/backend-api/codex/responses'), false, 'HTTP 模式下不应匹配 wss');
+  assert.equal(matchesProviderEndpoint(codex, 'wss://chatgpt.com/backend-api/codex/responses?beta=1', { allowWebSocket: true }), true);
+  assert.equal(matchesProviderEndpoint(codex, 'ws://chatgpt.com/backend-api/codex/responses', { allowWebSocket: true }), false, 'https 与 ws 协议族不匹配');
+  assert.equal(matchesProviderEndpoint(codex, 'wss://other.test/backend-api/codex/responses', { allowWebSocket: true }), false);
+  assert.equal(matchesProviderEndpoint({ api: 'openai-codex-responses', id: 'gpt-5.4', baseUrl: 'http://127.0.0.1:8080/backend-api' }, 'ws://127.0.0.1:8080/backend-api/codex/responses', { allowWebSocket: true }), true);
+  assert.equal(matchesProviderEndpoint({ api: 'openai-responses', id: 'gpt-5', baseUrl: 'https://api.example.test/v1' }, 'wss://api.example.test/v1/responses', { allowWebSocket: true }), true);
+
+  // 自定义 Anthropic baseUrl 已带 /v1 时同时兼容 /v1/v1/messages 与 /v1/messages
+  const anthropicV1 = { api: 'anthropic-messages', id: 'claude-sonnet', baseUrl: 'https://proxy.example.test/v1' };
+  assert.equal(matchesProviderEndpoint(anthropicV1, 'https://proxy.example.test/v1/v1/messages'), true);
+  assert.equal(matchesProviderEndpoint(anthropicV1, 'https://proxy.example.test/v1/messages'), true);
+  assert.equal(matchesProviderEndpoint(anthropicV1, 'https://proxy.example.test/v1/other'), false);
+
+  // 虚拟模型候选推断与按实际出站 URL 精确反查物理模型
+  assert.equal(isVirtualModelApi('pi-virtual'), true);
+  assert.equal(isVirtualModelApi('openai-responses'), false);
+  const physicalCatalog = [
+    { provider: 'router', id: 'fusion', api: 'pi-virtual', baseUrl: '' },
+    { provider: 'custom.chat', id: 'deepseek-v4', api: 'openai-completions', baseUrl: 'https://gateway.test/v1' },
+    { provider: 'custom.resp', id: 'gpt-6', api: 'openai-responses', baseUrl: 'https://gateway.test/v1' },
+    { provider: 'custom.gemini', id: 'gemini-2.5-flash', api: 'google-generative-ai', baseUrl: 'https://gateway.test/v1' },
+    { provider: 'custom.gemini', id: 'gemini-2.5-pro', api: 'google-generative-ai', baseUrl: 'https://gateway.test/v1' },
+    { provider: 'openai-codex', id: 'gpt-5.4', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    { provider: 'antigravity', id: 'gemini-4-neon', api: 'antigravity-acp', baseUrl: 'acp://antigravity-cli' },
+  ];
+  const chatInferred = inferCandidateModels({ model: 'deepseek-v4', messages: [{ role: 'user', content: 'hi' }] }, physicalCatalog);
+  assert.deepEqual(chatInferred.map((m) => `${m.provider}/${m.id}`), ['custom.chat/deepseek-v4']);
+
+  // Google 载荷不含 model 字段，凭实际 URL 中的 /models/<id>:streamGenerateContent 精确区分
+  const googleInferred = inferCandidateModels({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }, physicalCatalog);
+  assert.equal(googleInferred.length, 2);
+  const resolvedGoogle = resolveEndpointCandidate(
+    { candidates: googleInferred, bytes: 100 },
+    'https://gateway.test/v1/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+  );
+  assert.equal(resolvedGoogle.provider, 'custom.gemini');
+  assert.equal(resolvedGoogle.model, 'gemini-2.5-pro');
+  assert.equal(resolvedGoogle.api, 'google-generative-ai');
+
+  // WebSocket 虚拟模型候选反查
+  const codexInferred = inferCandidateModels({ model: 'gpt-5.4', input: [{ role: 'user', content: 'hi' }] }, physicalCatalog);
+  const resolvedWs = resolveEndpointCandidate(
+    { candidates: codexInferred, payloadModel: 'gpt-5.4' },
+    'wss://chatgpt.com/backend-api/codex/responses',
+    { allowWebSocket: true },
+  );
+  assert.equal(resolvedWs.provider, 'openai-codex');
+  assert.equal(resolvedWs.model, 'gpt-5.4');
+  assert.equal(resolvedWs.api, 'openai-codex-responses');
+
+  // ACP 直接载荷推断
+  const acpInferred = inferCandidateModels({ sessionId: 's1', prompt: [{ type: 'text', text: 'hi' }] }, physicalCatalog);
+  assert.deepEqual(acpInferred.map((m) => `${m.provider}/${m.id}`), ['antigravity/gemini-4-neon']);
+  assert.deepEqual(inferCandidateModels({ unknown: true }, physicalCatalog), []);
 });

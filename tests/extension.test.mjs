@@ -940,3 +940,202 @@ test('模型级启用：交互式 TUI 选择器、models list/reset 命令与配
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('虚拟模型路由（pi-virtual）：HTTP、Google 与 antigravity-acp 流量统计、物理模型归属校准与关闭态统计', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-virtual-'));
+  const keys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR', 'PI_TRAFFIC_OPT_ARCHIVE_DIR'];
+  const previousEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const priorFetch = globalThis.fetch;
+  const configPath = join(dir, 'config.json');
+  const reportDir = join(dir, 'report');
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = configPath;
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = reportDir;
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  globalThis.fetch = async () => new Response('{}', { status: 200 });
+  try {
+    const virtualModel = { provider: 'router', id: 'fusion', api: 'pi-virtual', baseUrl: '' };
+    const sharedBase = 'https://gateway.test/v1';
+    const chatModelA = { provider: 'custom.alpha', id: 'shared-chat', api: 'openai-completions', baseUrl: sharedBase };
+    const chatModelB = { provider: 'custom.beta', id: 'shared-chat', api: 'openai-completions', baseUrl: sharedBase };
+    const geminiPro = { provider: 'custom.gemini', id: 'gemini-2.5-pro', api: 'google-generative-ai', baseUrl: sharedBase };
+    const geminiFlash = { provider: 'custom.gemini', id: 'gemini-2.5-flash', api: 'google-generative-ai', baseUrl: sharedBase };
+    const acpModel = { provider: 'antigravity', id: 'gemini-4-neon', api: 'antigravity-acp', baseUrl: 'acp://antigravity-cli' };
+    const allModels = [virtualModel, chatModelA, chatModelB, geminiFlash, geminiPro, acpModel];
+    const app = await harness({
+      model: virtualModel,
+      modelRegistry: { getAvailable: () => allModels, getAll: () => allModels },
+    });
+    await app.emit('session_start');
+    assert.equal(app.statuses.at(-1), '累计上传 0.000 MiB | 当前 0.000 MiB | 图片压缩率 0.0%');
+
+    // 1) 虚拟模型路由到同网关同名 OpenAI 兼容模型，message_end 精确校准到真实 provider（custom.beta）
+    const chatPayload = { model: 'shared-chat', messages: [{ role: 'user', content: '路由到 chat 模型' }] };
+    const chatBody = JSON.stringify(chatPayload);
+    await app.emit('context_with_system', { messages: [{ role: 'user', content: [{ type: 'text', text: '路由到 chat 模型' }] }] });
+    app.emit('before_provider_request', { payload: chatPayload });
+    await globalThis.fetch(`${sharedBase}/chat/completions`, { method: 'POST', body: chatBody });
+    await app.emit('message_end', {
+      message: {
+        role: 'assistant', provider: 'custom.beta', model: 'shared-chat', api: 'openai-completions',
+        usage: { input: 120, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    assert.equal(app.statuses.at(-1), `累计上传 ${asMiB(Buffer.byteLength(chatBody))} | 当前 ${asMiB(Buffer.byteLength(chatBody))} | 图片压缩率 0.0%`);
+
+    // 2) 虚拟模型路由到 Google 模型（payload 无 model 字段，由 URL 精确归属 gemini-2.5-pro）
+    const googlePayload = { contents: [{ role: 'user', parts: [{ text: '路由到 gemini' }] }] };
+    const googleBody = JSON.stringify(googlePayload);
+    await app.emit('context_with_system', { messages: [{ role: 'user', content: [{ type: 'text', text: '路由到 gemini' }] }] });
+    app.emit('before_provider_request', { payload: googlePayload });
+    await globalThis.fetch(`${sharedBase}/models/gemini-2.5-pro:streamGenerateContent?alt=sse`, { method: 'POST', body: googleBody });
+    await app.emit('message_end', {
+      message: {
+        role: 'assistant', provider: 'custom.gemini', model: 'gemini-2.5-pro', api: 'google-generative-ai',
+        usage: { input: 240, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+
+    // 3) 虚拟模型在全局关闭状态下路由到 antigravity-acp（acp-upstream + MCP 续传）
+    await app.command.handler('off', app.ctx);
+    assert.equal(app.statuses.at(-1).includes('图片压缩率'), false);
+    await app.emit('context_with_system', { messages: [{ role: 'user', content: [{ type: 'text', text: '路由到 ACP' }] }] });
+    app.emit('before_provider_request', { payload: { sessionId: 'virtual-acp-1', prompt: [{ type: 'text', text: '路由到 ACP' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'virtual-acp-1', 'x-acp-upstream-pending': '1' } });
+    const acpSnap = {
+      total_payload_bytes: 32768, json_payload_bytes: 32768,
+      system_bytes: 2048, user_text_bytes: 30720, assistant_text_bytes: 0,
+      tool_call_bytes: 0, tool_result_bytes: 0, image_payload_bytes: 0, image_decoded_bytes: 0,
+      tool_schema_bytes: 0, opaque_reasoning_bytes: 0, other_bytes: 0,
+      text_content_utf8_bytes: 30720, image_count: 0, images: [], results: [],
+    };
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: {
+        'x-acp-session-id': 'virtual-acp-1',
+        'x-acp-transport': 'acp-upstream',
+        'x-acp-upstream-gen-count': '1',
+        'x-acp-upstream-snapshot': JSON.stringify(acpSnap),
+      },
+    });
+    await app.emit('message_end', {
+      message: {
+        role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', api: 'antigravity-acp',
+        usage: { input: 512, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    const totalExpected = Buffer.byteLength(chatBody) + Buffer.byteLength(googleBody) + 32768;
+    assert.equal(app.statuses.at(-1), `累计上传 ${asMiB(totalExpected)} | 当前 ${asMiB(32768)}`);
+
+    await app.emit('agent_settled');
+    const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
+    assert.equal(summary.request_count, 3);
+    assert.equal(summary.total_upload_bytes, totalExpected);
+    assert.deepEqual(
+      summary.requests.map((r) => `${r.provider}/${r.model}:${r.api}:${r.transport}`),
+      [
+        'custom.beta/shared-chat:openai-completions:http-fetch',
+        'custom.gemini/gemini-2.5-pro:google-generative-ai:http-fetch',
+        'antigravity/gemini-4-neon:antigravity-acp:acp-upstream',
+      ],
+    );
+    await app.emit('session_shutdown');
+  } finally {
+    globalThis.fetch = priorFetch;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('WebSocket 传输（openai-codex-responses）：全量帧、增量续传帧、错误状态与状态栏/报告联动', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-ws-'));
+  const keys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR', 'PI_TRAFFIC_OPT_ARCHIVE_DIR'];
+  const previousEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const priorFetch = globalThis.fetch;
+  const priorWS = globalThis.WebSocket;
+  const configPath = join(dir, 'config.json');
+  const reportDir = join(dir, 'report');
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = configPath;
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = reportDir;
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  class MockCodexWS {
+    static OPEN = 1;
+    constructor(url) { this.url = String(url); this.frames = []; }
+    send(data) { this.frames.push(data); }
+  }
+  globalThis.WebSocket = MockCodexWS;
+  globalThis.fetch = async () => new Response('{}', { status: 200 });
+  try {
+    const codexModel = { provider: 'openai-codex', id: 'gpt-5.4', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' };
+    const app = await harness({ model: codexModel });
+    await app.emit('session_start');
+
+    const socket = new globalThis.WebSocket('wss://chatgpt.com/backend-api/codex/responses');
+    // 第 1 轮：完整上下文帧
+    const fullPayload = {
+      model: 'gpt-5.4',
+      instructions: '系统指令',
+      input: [{ role: 'user', content: [{ type: 'input_text', text: '第一轮问题' }] }],
+    };
+    const frame1 = JSON.stringify({ type: 'response.create', ...fullPayload });
+    await app.emit('context_with_system', { messages: [{ role: 'user', content: [{ type: 'text', text: '第一轮问题' }] }] });
+    app.emit('before_provider_request', { payload: fullPayload });
+    socket.send(frame1);
+    await app.emit('message_end', {
+      message: { role: 'assistant', stopReason: 'stop', usage: { input: 300, cacheRead: 100, cacheWrite: 0 } },
+    });
+    assert.equal(app.statuses.at(-1), `累计上传 ${asMiB(Buffer.byteLength(frame1))} | 当前 ${asMiB(Buffer.byteLength(frame1))} | 图片压缩率 0.0%`);
+
+    // 第 2 轮：websocket-cached 增量续传帧 + 错误响应状态提取
+    const fullPayload2 = {
+      model: 'gpt-5.4',
+      instructions: '系统指令',
+      input: [
+        { role: 'user', content: [{ type: 'input_text', text: '第一轮问题' }] },
+        { role: 'assistant', content: [{ type: 'output_text', text: '第一轮回答' }] },
+        { role: 'user', content: [{ type: 'input_text', text: '第二轮追问' }] },
+      ],
+    };
+    const deltaFrame = JSON.stringify({
+      type: 'response.create',
+      model: 'gpt-5.4',
+      instructions: '系统指令',
+      previous_response_id: 'resp_1',
+      input: [{ role: 'user', content: [{ type: 'input_text', text: '第二轮追问' }] }],
+    });
+    await app.emit('context_with_system', { messages: [{ role: 'user', content: [{ type: 'text', text: '第二轮追问' }] }] });
+    app.emit('before_provider_request', { payload: fullPayload2 });
+    socket.send(deltaFrame);
+    await app.emit('message_end', {
+      message: { role: 'assistant', stopReason: 'error', errorMessage: 'Codex error 429 rate limit', usage: { input: 0, cacheRead: 0, cacheWrite: 0 } },
+    });
+    const expectedTotal = Buffer.byteLength(frame1) + Buffer.byteLength(deltaFrame);
+    assert.equal(app.statuses.at(-1), `累计上传 ${asMiB(expectedTotal)} | 当前 ${asMiB(Buffer.byteLength(deltaFrame))} | 图片压缩率 0.0%`);
+
+    await app.emit('agent_settled');
+    const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
+    const reportMd = await readFile(join(reportDir, 'report.md'), 'utf8');
+    assert.equal(summary.request_count, 2);
+    assert.equal(summary.total_upload_bytes, expectedTotal);
+    assert.equal(summary.requests[0].transport, 'websocket');
+    assert.equal(summary.requests[0].context_tokens, 400);
+    assert.equal(summary.requests[1].transport, 'websocket');
+    assert.equal(summary.requests[1].total_payload_bytes, Buffer.byteLength(deltaFrame));
+    assert.equal(summary.requests[1].response_status, 429);
+    assert.equal(reportMd.includes('WebSocket 覆盖实际发送帧正文'), true);
+    assert.equal(reportMd.includes('WebSocket 未计量'), false);
+    await app.emit('session_shutdown');
+  } finally {
+    globalThis.WebSocket = priorWS;
+    globalThis.fetch = priorFetch;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -16,7 +16,7 @@ export default async function (pi: ExtensionAPI) {
   for (const file of runtimeFiles) digest.update(file).update(readFileSync(join(import.meta.dirname, file)));
   const revision = digest.digest('hex');
   const [{ ImageOptimizer }, { normalizeConfiguration, modelKey, isModelAllowed, isModelEnabled }, { ContextMemory }, , { TrafficReporter },
-    { analyzePayload, isDirectPayloadApi, isProviderPayload, sourcesFromContext, mib }, { observeRequests }] = await Promise.all(runtimeFiles.map(file =>
+    { analyzePayload, inferCandidateModels, isDirectPayloadApi, isProviderPayload, isVirtualModelApi, sourcesFromContext, mib }, { observeRequests }] = await Promise.all(runtimeFiles.map(file =>
       loadNativeModule(pathToFileURL(join(import.meta.dirname, file)).href + '?runtime=' + revision)));
   const toMiB = (value: number) => `${mib(value)} MiB`;
   const readConfig = (path: string) => {
@@ -49,6 +49,7 @@ export default async function (pi: ExtensionAPI) {
   const seen = new Set<string>();
   const hashes = new Map<string, string>();
   const knownImageMetrics = new Map<string, { originalBytes: number; optimizedBytes: number }>();
+  const inferredRecords = new WeakSet<object>();
   const waiting: any[] = [];
   let context: ReturnType<typeof sourcesFromContext> | undefined;
   let imageStats: { originalBytes: number; optimizedBytes: number } | undefined;
@@ -238,6 +239,7 @@ export default async function (pi: ExtensionAPI) {
       profile_ms: Math.round((performance.now() - started) * 10) / 10,
     };
     reporter.add(record);
+    if (request.inferredModel) inferredRecords.add(record);
     if (enqueueWaiting) {
       waiting.length = 0;
       waiting.push(record);
@@ -345,6 +347,7 @@ export default async function (pi: ExtensionAPI) {
       profile_ms: Math.round((performance.now() - started) * 10) / 10,
     };
     reporter.add(record);
+    if (meta?.inferredModel) inferredRecords.add(record);
     if (enqueueWaiting) {
       waiting.length = 0;
       waiting.push(record);
@@ -488,6 +491,25 @@ export default async function (pi: ExtensionAPI) {
     }
   };
   registerRecall(enabled && currentConfig.contextOptimization.enabled && currentConfig.contextOptimization.recall ? 'direct' : 'hidden');
+
+  const collectPhysicalModels = (ctx?: any): any[] => {
+    const result: any[] = [];
+    const seenKeys = new Set<string>();
+    try {
+      const registry = ctx?.modelRegistry ?? activeCtx?.modelRegistry;
+      const all = registry?.getAll?.();
+      const available = registry?.getAvailable?.();
+      const list = Array.isArray(all) && all.length > 0 ? all : (Array.isArray(available) ? available : []);
+      for (const item of list) {
+        if (!item || typeof item !== 'object' || isVirtualModelApi(item.api)) continue;
+        const key = `${item.provider ?? ''}/${item.id ?? ''}/${item.api ?? ''}/${item.baseUrl ?? ''}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        result.push(item);
+      }
+    } catch { /* 忽略无法访问的模型注册表。 */ }
+    return result;
+  };
 
   const collectKnownModels = (ctx?: any): Array<{ key: string; id: string; provider: string; isCurrent: boolean }> => {
     const map = new Map<string, { key: string; id: string; provider: string; isCurrent: boolean }>();
@@ -996,20 +1018,16 @@ export default async function (pi: ExtensionAPI) {
     syncRecallExposure(ctx);
     imageStats = undefined; imageMetrics = undefined; projectionStats = undefined; pendingAcpContinuation = undefined; pendingAcpGc = false;
     const isDirectModel = Boolean(ctx?.model && isDirectPayloadApi(ctx.model.api));
-    if (!isDirectModel) acpProjectionDesynced = false;
-    if (!modelActive) {
-      context = sourcesFromContext(event.messages);
+    const isVirtualModel = Boolean(ctx?.model && isVirtualModelApi(ctx.model.api));
+    if (!isDirectModel && !isVirtualModel) acpProjectionDesynced = false;
+    const prepareAcpContinuation = (messagesForAcp: any[], metaOverrides: any) => {
       if (isDirectModel) {
         lastDirectMeta = {
-          optimizationActive: false,
-          reusedImageHashes: undefined,
-          context, imageStats: undefined, imageMetrics: undefined, projectionStats: undefined,
+          ...metaOverrides,
           provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
           api: ctx.model.api, baseUrl: ctx.model.baseUrl,
-          estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
-          ui: safeUiOf(ctx) ?? safeUiOf(activeCtx),
         };
-        const { results: toolResults, hasTrailingUser } = extractAcpMcpToolResults(event.messages);
+        const { results: toolResults, hasTrailingUser } = extractAcpMcpToolResults(messagesForAcp);
         if (toolResults.length > 0) {
           pendingAcpContinuation = {
             ...lastDirectMeta,
@@ -1017,7 +1035,47 @@ export default async function (pi: ExtensionAPI) {
             hasTrailingUser,
           };
         }
+        return;
       }
+      if (isVirtualModel) {
+        const { results: toolResults, hasTrailingUser } = extractAcpMcpToolResults(messagesForAcp);
+        if (toolResults.length > 0) {
+          const inferredDirect = inferCandidateModels({ toolResults }, collectPhysicalModels(ctx))[0];
+          const baseDirect = lastDirectMeta && isDirectPayloadApi(lastDirectMeta.api)
+            ? lastDirectMeta
+            : {
+                provider: inferredDirect?.provider ?? 'antigravity',
+                model: inferredDirect?.id ?? 'unknown',
+                id: inferredDirect?.id ?? 'unknown',
+                api: inferredDirect?.api ?? 'antigravity-acp',
+                baseUrl: inferredDirect?.baseUrl ?? 'acp://antigravity-cli',
+              };
+          lastDirectMeta = {
+            ...metaOverrides,
+            provider: baseDirect.provider,
+            model: baseDirect.model,
+            id: baseDirect.id,
+            api: baseDirect.api,
+            baseUrl: baseDirect.baseUrl,
+            inferredModel: true,
+          };
+          pendingAcpContinuation = {
+            ...lastDirectMeta,
+            payload: { toolResults },
+            hasTrailingUser,
+          };
+        }
+      }
+    };
+    if (!modelActive) {
+      context = sourcesFromContext(event.messages);
+      prepareAcpContinuation(event.messages, {
+        optimizationActive: false,
+        reusedImageHashes: undefined,
+        context, imageStats: undefined, imageMetrics: undefined, projectionStats: undefined,
+        estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
+        ui: safeUiOf(ctx) ?? safeUiOf(activeCtx),
+      });
       updateStatus(ctx);
       return;
     }
@@ -1029,7 +1087,7 @@ export default async function (pi: ExtensionAPI) {
       if (!pi.getActiveTools || pi.getActiveTools().includes('context_recall')) {
         const result = await memory.project(event.messages, ctx);
         projected = result.messages; projectionStats = result.stats;
-        if (isDirectModel && projectionStats?.gcTriggered) pendingAcpGc = true;
+        if ((isDirectModel || (isVirtualModel && lastAcpSessionId)) && projectionStats?.gcTriggered) pendingAcpGc = true;
       } else {
         memory.last = { skipped: 'recall_inactive' };
       }
@@ -1053,25 +1111,13 @@ export default async function (pi: ExtensionAPI) {
         knownImageMetrics.delete(oldest);
       }
       context = sourcesFromContext(messages);
-      if (isDirectModel) {
-        lastDirectMeta = {
-          optimizationActive: true,
-          reusedImageHashes: reusedRecallImageHashes,
-          context, imageStats: stats, imageMetrics: pairs, projectionStats,
-          provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
-          api: ctx.model.api, baseUrl: ctx.model.baseUrl,
-          estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
-          ui: safeUiOf(ctx) ?? safeUiOf(activeCtx),
-        };
-        const { results: toolResults, hasTrailingUser } = extractAcpMcpToolResults(messages);
-        if (toolResults.length > 0) {
-          pendingAcpContinuation = {
-            ...lastDirectMeta,
-            payload: { toolResults },
-            hasTrailingUser,
-          };
-        }
-      }
+      prepareAcpContinuation(messages, {
+        optimizationActive: true,
+        reusedImageHashes: reusedRecallImageHashes,
+        context, imageStats: stats, imageMetrics: pairs, projectionStats,
+        estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
+        ui: safeUiOf(ctx) ?? safeUiOf(activeCtx),
+      });
       return { messages };
     } catch {
       context = undefined;
@@ -1143,11 +1189,22 @@ export default async function (pi: ExtensionAPI) {
     waiting.length = 0;
     try {
       const model = ctx.model;
-      if (!model || !isProviderPayload(model.api, event.payload)) return;
+      if (!model) return;
       const modelActive = isModelEnabled(currentConfig, model);
+      const isVirtual = isVirtualModelApi(model.api);
+      let targetModel: any = model;
+      let candidateModels: any[] | undefined;
+      if (isVirtual) {
+        const inferred = inferCandidateModels(event.payload, collectPhysicalModels(ctx));
+        if (inferred.length === 0) return;
+        targetModel = inferred[0];
+        if (!isDirectPayloadApi(targetModel.api)) candidateModels = inferred;
+      } else if (!isProviderPayload(model.api, event.payload)) {
+        return;
+      }
       const body = JSON.stringify(event.payload);
       const wireBytes = Buffer.byteLength(body, 'utf8');
-      const request = {
+      const request: any = {
         bytes: wireBytes,
         optimizationActive: modelActive,
         context,
@@ -1155,12 +1212,18 @@ export default async function (pi: ExtensionAPI) {
         imageMetrics: modelActive ? imageMetrics : undefined,
         reusedImageHashes: modelActive ? reusedRecallImageHashes : undefined,
         projectionStats: modelActive ? projectionStats : undefined,
-        provider: model.provider, model: model.id, id: model.id,
-        api: model.api, baseUrl: model.baseUrl,
+        provider: targetModel.provider, model: targetModel.id, id: targetModel.id,
+        api: targetModel.api, baseUrl: targetModel.baseUrl,
         estimated_context_tokens: ctx.getContextUsage?.()?.tokens ?? null,
         ui: safeUiOf(ctx) ?? safeUiOf(activeCtx),
+        ...(isVirtual ? {
+          inferredModel: true,
+          virtualModel: modelKey(model),
+          payloadModel: typeof (event.payload as any)?.model === 'string' ? (event.payload as any).model.trim() : undefined,
+        } : {}),
+        ...(candidateModels ? { candidates: candidateModels } : {}),
       };
-      if (isDirectPayloadApi(model.api)) {
+      if (isDirectPayloadApi(targetModel.api)) {
         const nextSessionId = typeof (event.payload as any)?.sessionId === 'string'
           ? (event.payload as any).sessionId as string
           : undefined;
@@ -1177,7 +1240,7 @@ export default async function (pi: ExtensionAPI) {
         // 先暂存直接载荷，待 after_provider_response 确认是否由 acp-upstream 全量快照接管或立即按 acp-stdio 落账。
         pendingAcpDirect = {
           request,
-          endpoint: model.baseUrl || 'acp://antigravity-cli',
+          endpoint: targetModel.baseUrl || 'acp://antigravity-cli',
           body,
           wireBytes,
           transport: 'acp-stdio',
@@ -1187,6 +1250,10 @@ export default async function (pi: ExtensionAPI) {
           prevDesynced,
         };
       } else {
+        if (isVirtual) {
+          acpProjectionDesynced = false;
+          pendingAcpGc = false;
+        }
         candidate = request;
       }
     } catch { candidate = undefined; pendingAcpDirect = undefined; pendingAcpUpstreamFallback = undefined; }
@@ -1225,16 +1292,21 @@ export default async function (pi: ExtensionAPI) {
           try { snapshot = JSON.parse(rawSnapshot); } catch { snapshot = undefined; }
         }
         const fallbackModel = safeModelOf(ctx) ?? safeModelOf(activeCtx);
+        const fallbackIsVirtual = isVirtualModelApi(fallbackModel?.api);
+        const inferredFallback = fallbackIsVirtual
+          ? inferCandidateModels({ sessionId: '', prompt: [] }, collectPhysicalModels(ctx))[0]
+          : undefined;
         const pendingMeta = (isDetached
           ? lastDirectMeta
           : (pendingAcpUpstreamFallback?.request ?? pendingAcpDirect?.request ?? lastDirectMeta))
           ?? {
             optimizationActive: isModelEnabled(currentConfig, fallbackModel),
-            provider: fallbackModel?.provider,
-            model: fallbackModel?.id,
-            id: fallbackModel?.id,
-            api: fallbackModel?.api,
-            baseUrl: fallbackModel?.baseUrl,
+            provider: fallbackIsVirtual ? (inferredFallback?.provider ?? 'antigravity') : fallbackModel?.provider,
+            model: fallbackIsVirtual ? (inferredFallback?.id ?? 'unknown') : fallbackModel?.id,
+            id: fallbackIsVirtual ? (inferredFallback?.id ?? 'unknown') : fallbackModel?.id,
+            api: fallbackIsVirtual ? (inferredFallback?.api ?? 'antigravity-acp') : fallbackModel?.api,
+            baseUrl: fallbackIsVirtual ? (inferredFallback?.baseUrl ?? 'acp://antigravity-cli') : fallbackModel?.baseUrl,
+            inferredModel: fallbackIsVirtual,
             ui: safeUiOf(ctx) ?? safeUiOf(activeCtx),
           };
         if (snapshot && typeof snapshot === 'object') {
@@ -1398,7 +1470,14 @@ export default async function (pi: ExtensionAPI) {
       const record = waiting.shift();
       if (record) {
         record.context_tokens = contextTokens;
-        if ((record.transport === 'acp-mcp-result' || record.transport === 'acp-upstream') && event.message.stopReason === 'error') {
+        if (inferredRecords.has(record)) {
+          if (typeof event.message.provider === 'string' && event.message.provider) record.provider = event.message.provider;
+          if (typeof event.message.model === 'string' && event.message.model) record.model = event.message.model;
+          if (typeof event.message.api === 'string' && event.message.api && !isVirtualModelApi(event.message.api)) {
+            record.api = event.message.api;
+          }
+        }
+        if ((record.transport === 'acp-mcp-result' || record.transport === 'acp-upstream' || record.transport === 'websocket') && event.message.stopReason === 'error') {
           const statusMatch = /\b([45]\d\d)\b/.exec(event.message.errorMessage ?? '');
           record.response_status = statusMatch ? Number(statusMatch[1]) : null;
         }

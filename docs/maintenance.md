@@ -39,7 +39,7 @@ flowchart LR
 | `src/archive.mjs` | SQLite WAL、FTS5、内容寻址 blob、事务和 GC |
 | `src/configuration.mjs` | 配置默认值及边界校验 |
 | `src/profile.mjs` | 协议结构、推理端点匹配、正文分类与图片来源 |
-| `src/transport.mjs` | fetch、Node HTTP/1 与 HTTP/2 的最终正文及响应状态观测 |
+| `src/transport.mjs` | fetch、WebSocket、Node HTTP/1 与 HTTP/2 的最终正文及响应状态观测 |
 | `src/reporting.mjs` | 增量事件、CSV 和有界汇总报告 |
 | `<数据目录>/archive/index.sqlite` | 对象、blob 引用、关系、usage、projection 和 FTS 索引 |
 | `<数据目录>/archive/blobs/<sha256>.blob` | 工具内容、完整可用 stdout、参数、原图和优化图 |
@@ -64,11 +64,11 @@ flowchart LR
 
 | API | 请求入口 | 传输 |
 |---|---|---|
-| `openai-responses` / `azure-openai-responses` | `/responses`，包含 Azure 路径规范化 | fetch |
-| `openai-codex-responses` | `/codex/responses`，支持已含入口的 baseUrl | fetch |
+| `openai-responses` / `azure-openai-responses` | `/responses`，包含 Azure 路径规范化 | fetch / WebSocket |
+| `openai-codex-responses` | `/codex/responses`，支持已含入口的 baseUrl | fetch / WebSocket |
 | `openai-completions` | `/chat/completions` | fetch |
 | `mistral-conversations` | `/v1/chat/completions`，使用最终 snake_case 正文 | fetch |
-| `anthropic-messages` | `/v1/messages` | fetch |
+| `anthropic-messages` | `/v1/messages`（兼容已含 `/v1` 前缀的自定义端点） | fetch |
 | `google-generative-ai` / `google-vertex` | `models/<模型>:streamGenerateContent` | fetch |
 | `bedrock-converse-stream` | `/model/<模型>/converse-stream` | Node HTTP/2、代理或强制 HTTP/1 |
 | `pi-messages` | `/messages` | fetch |
@@ -80,7 +80,9 @@ flowchart LR
 
 fetch 支持字符串、URL、Request，以及字符串、二进制或 Blob 正文。`gzip`、`deflate`、`br` 和 `zstd` 正文按实际压缩字节计入累计上传，分类使用解压后的 JSON。单次解压上限为 256 MiB；无法解码的正文跳过观测，原请求继续发送。每次重试分别记录实际请求与响应状态；assistant 完成后清除本次候选请求。
 
-HTTP/2 观测依赖 Node 的 `http2.client.stream` diagnostics channels；缺少相应频道的运行时无法采集该路径。WebSocket 暂无上传计量，转换前的图片压缩与投影继续工作。未知 API 不推断流量分类。
+WebSocket 观测通过透明包装 `globalThis.WebSocket` 与 `WebSocket.prototype.send` 采集实际发送帧正文（含全量请求与 `previous_response_id` 增量续传帧），并支持复用重载前已建立的会话连接。当会话选用虚拟模型（`api === "pi-virtual"`，如多模型路由器）时，`before_provider_request` 根据载荷结构与 `modelRegistry` 推断候选物理模型集合，传输层再结合实际出站 URL 反查精确物理模型，并在 `message_end` 依据响应消息字段校准 `provider`/`model`/`api`；路由到 `antigravity-acp` 时同步承接 `acp-upstream` 与宿主 MCP 续传链路。
+
+HTTP/2 观测依赖 Node 的 `http2.client.stream` diagnostics channels；缺少相应频道的运行时无法采集该路径。未知 API 不推断流量分类。
 
 ## 配置
 
@@ -226,7 +228,7 @@ npm run benchmark
 - `image_bytes_avoided`：优化图片二进制的 counterfactual 避免量。
 - token 压力及 compact 压力缓解：estimated；缺少未投影的真实 HTTP 对照时，HTTP 节省为 null。
 - p50/p95 请求大小：对数直方图估算；benchmark 的耗时分位来自实际样本。
-- HTTP profiler 覆盖上表中的实际请求路径；WebSocket、响应正文、TCP/TLS 字节未计量。
+- 流量 profiler 覆盖上表中的 HTTP、WebSocket 与 ACP 实际请求路径；响应正文、TCP/TLS 字节未计量。
 
 现场维护验证的结果只证明相应环境和工作负载。默认对照可验证上传量变化；本地 synthetic usage 的 compact 次数不能推广为真实远程模型的保证。
 

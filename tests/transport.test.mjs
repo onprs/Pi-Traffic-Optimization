@@ -164,3 +164,129 @@ test('Bedrock HTTP/2 通过 diagnostics 采集合并及分块写入，UTF-8 字�
     assert.ok(observation.records.every(record => record.transport === 'node-http2' && record.status === 202));
   } finally { observation.stop(); client.destroy(); await close(server); }
 });
+
+test('WebSocket 观测覆盖原型 send、复用连接、重载前已建连接、异常透传与还原', async () => {
+  const beforeWS = globalThis.WebSocket;
+  const sent = [];
+  class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url) {
+      this.url = String(url);
+      this.failNext = false;
+    }
+    send(data) {
+      if (this.failNext) {
+        this.failNext = false;
+        throw new Error('socket closed');
+      }
+      sent.push({ url: this.url, data });
+    }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+  const preExisting = new FakeWebSocket('wss://chatgpt.com/backend-api/codex/responses?token=secret');
+  const originalProtoSend = FakeWebSocket.prototype.send;
+  const wsBody1 = JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: [{ role: 'user', content: [{ type: 'input_text', text: '首轮' }] }] });
+  const wsBody2 = JSON.stringify({ type: 'response.create', model: 'gpt-5.4', previous_response_id: 'resp_1', input: [{ role: 'user', content: [{ type: 'input_text', text: '续传' }] }] });
+  let shouldThrowOnRequest = false;
+  const records = [];
+  let active = true;
+  const stop = observeRequests({
+    getCandidate: () => active ? { api: 'openai-codex-responses', id: 'gpt-5.4', baseUrl: 'https://chatgpt.com/backend-api' } : undefined,
+    onRequest: (request) => {
+      if (shouldThrowOnRequest) throw new Error('报告写入失败');
+      records.push(request);
+      return request;
+    },
+    onResponse: () => {},
+  });
+  try {
+    assert.equal(globalThis.WebSocket.OPEN, 1);
+    const socket = new globalThis.WebSocket('wss://chatgpt.com/backend-api/codex/responses?api-key=secret');
+    assert.equal(socket instanceof FakeWebSocket, true);
+    socket.send(wsBody1);
+    socket.send(new TextEncoder().encode(wsBody2));
+    // 复用重载前已存在的连接
+    preExisting.send(new Blob([wsBody2]));
+    await new Promise(resolve => setImmediate(resolve));
+    // 无关地址不应被捕获
+    const other = new globalThis.WebSocket('wss://other.test/ws');
+    other.send(wsBody1);
+    // send 抛同步异常时透传原异常且不误记账
+    socket.failNext = true;
+    assert.throws(() => socket.send(wsBody1), /socket closed/);
+    // onRequest 内部抛错不影响 send 正常完成
+    shouldThrowOnRequest = true;
+    socket.send(wsBody1);
+    shouldThrowOnRequest = false;
+
+    assert.equal(sent.length, 5);
+    assert.equal(records.length, 3);
+    assert.deepEqual(records.map(r => r.body), [wsBody1, wsBody2, wsBody2]);
+    assert.deepEqual(records.map(r => r.wireBytes), [Buffer.byteLength(wsBody1), Buffer.byteLength(wsBody2), Buffer.byteLength(wsBody2)]);
+    assert.ok(records.every(r => r.transport === 'websocket'));
+    assert.ok(records.every(r => r.endpoint === 'wss://chatgpt.com/backend-api/codex/responses'));
+
+    // 停用后不再记录
+    active = false;
+    socket.send(wsBody1);
+    assert.equal(records.length, 3);
+  } finally {
+    stop();
+    assert.equal(globalThis.WebSocket, FakeWebSocket);
+    assert.equal(FakeWebSocket.prototype.send, originalProtoSend);
+    globalThis.WebSocket = beforeWS;
+  }
+});
+
+test('WebSocket 实例自有 send 不重复记账，且支持虚拟模型多候选在 fetch 与 WebSocket 上精确反查', async () => {
+  const beforeWS = globalThis.WebSocket;
+  const server = createServer(async (req, res) => {
+    for await (const _ of req) {}
+    res.writeHead(200); res.end('{}');
+  });
+  const baseUrl = await listen(server);
+  class OwnSendWS {
+    constructor(url) {
+      this.url = String(url);
+      this.sent = [];
+      this.send = (data) => { this.sent.push(data); };
+    }
+  }
+  globalThis.WebSocket = OwnSendWS;
+  const multiCandidate = {
+    payloadModel: 'gpt-5.4',
+    candidates: [
+      { provider: 'custom.chat', id: 'deepseek-v4', api: 'openai-completions', baseUrl },
+      { provider: 'custom.gemini', id: 'gemini-2.5-flash', api: 'google-generative-ai', baseUrl },
+      { provider: 'custom.gemini', id: 'gemini-2.5-pro', api: 'google-generative-ai', baseUrl },
+      { provider: 'openai-codex', id: 'gpt-5.4', api: 'openai-codex-responses', baseUrl },
+    ],
+  };
+  const observation = observer(multiCandidate);
+  try {
+    await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body });
+    const googleBody = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hello' }] }] });
+    await fetch(`${baseUrl}/models/gemini-2.5-pro:streamGenerateContent?alt=sse`, { method: 'POST', body: googleBody });
+    const wsUrl = baseUrl.replace(/^http:/, 'ws:') + '/codex/responses';
+    const ws = new globalThis.WebSocket(wsUrl);
+    const codexBody = JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: [{ role: 'user', content: 'hi' }] });
+    ws.send(codexBody);
+
+    assert.equal(ws.sent.length, 1);
+    assert.equal(observation.records.length, 3);
+    assert.equal(observation.records[0].candidate.provider, 'custom.chat');
+    assert.equal(observation.records[0].candidate.model, 'deepseek-v4');
+    assert.equal(observation.records[1].candidate.provider, 'custom.gemini');
+    assert.equal(observation.records[1].candidate.model, 'gemini-2.5-pro');
+    assert.equal(observation.records[2].candidate.provider, 'openai-codex');
+    assert.equal(observation.records[2].candidate.model, 'gpt-5.4');
+    assert.equal(observation.records[2].transport, 'websocket');
+  } finally {
+    observation.stop();
+    globalThis.WebSocket = beforeWS;
+    await close(server);
+  }
+});
