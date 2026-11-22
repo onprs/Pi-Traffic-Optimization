@@ -295,6 +295,48 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     assert.deepEqual(summary.requests.map(r => r.context_tokens), [120, 240, 280]);
     assert.equal(summary.requests[0].endpoint, 'acp://antigravity-cli');
     assert.equal(summary.requests[1].endpoint, 'acp://antigravity-cli/mcp-result');
+
+    // 轮次 5：有状态热轮次中途触发 GC 时不应用未瘦身的后端 usage 污染 calibrationFactor，待下一轮 acp-stdio 重建后恢复校准
+    app.setActiveTools(['read', 'bash', 'context_recall']);
+    await app.command.handler('gc', app.ctx);
+    const bigText = '中'.repeat(24000);
+    const gcMessages = [
+      { role: 'user', content: '分析大文件' },
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_old', name: 'read', arguments: { path: 'old.txt' } }] },
+      { role: 'toolResult', toolCallId: 'agy_mcp_old', toolName: 'read', isError: false, content: [{ type: 'text', text: bigText }] },
+      ...Array.from({ length: 5 }, (_, idx) => ([
+        { role: 'user', content: `追问${idx}` },
+        { role: 'assistant', content: [{ type: 'text', text: '答复' }] },
+      ])).flat(),
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_hot', name: 'read', arguments: { path: 'hot.txt' } }] },
+      { role: 'toolResult', toolCallId: 'agy_mcp_hot', toolName: 'read', isError: false, content: [{ type: 'text', text: bigText }] },
+    ];
+    await app.emit('context_with_system', { messages: gcMessages });
+    // 热轮次无 before_provider_request，后端仍上报未瘦身的 60000 tokens
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
+    await app.command.handler('上下文', app.ctx);
+    assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1, '热轮次中途 GC 不应被未瘦身后端 usage 拉高校准系数');
+    // 紧接着同一热轮次的下一步也应保持不污染
+    await app.emit('context_with_system', { messages: gcMessages });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
+    await app.command.handler('上下文', app.ctx);
+    assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1);
+    // 下一新用户轮次走 before_provider_request（acp-stdio 重建同步）后，恢复正常动态校准
+    await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '下一轮' }] });
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-2', prompt: [{ type: 'text', text: '下一轮' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-2' } });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 35000, cacheWrite: 0 } } });
+    await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '确认校准' }] });
+    await app.command.handler('上下文', app.ctx);
+    assert.ok(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor > 1.2, '同步重建后应恢复正常动态校准');
+
+    // model_select 清理瞬态请求状态，避免误记上一轮残余 continuation
+    await app.emit('context_with_system', { messages: step2Messages });
+    await app.emit('model_select');
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10, cacheRead: 0, cacheWrite: 0 } } });
+    await app.emit('agent_settled');
+    const summaryAfter = JSON.parse(await readFile(join(report, 'summary.json'), 'utf8'));
+    assert.equal(summaryAfter.request_count, 6, 'model_select 后不应误记残留的 acp-mcp-result');
     await app.emit('session_shutdown');
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {

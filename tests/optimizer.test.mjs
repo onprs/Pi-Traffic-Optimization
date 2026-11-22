@@ -173,3 +173,18 @@ test('EXIF 方向校正并在缩放时保持方向和比例', async () => withCa
   assert.equal(meta.width, 128);
   assert.equal(meta.height, 256);
 }));
+
+test('alreadyOptimized 复用同图时不覆盖原图在 imageMetrics 中的真实压缩记录', async () => withCache(async (directory) => {
+  const png = await noisy(320, 320);
+  const engine = new ImageOptimizer({ cacheDir: directory });
+  const first = await engine.optimizeMessages([{ role: 'user', content: [image(png)] }], config);
+  const optimized = first.messages[0].content[0];
+  assert.equal(optimized.mimeType, 'image/webp');
+  const combined = await engine.optimizeMessages([
+    { role: 'user', content: [image(png)] },
+    { role: 'toolResult', toolName: 'context_recall', details: { contextId: 'ctx://image/a' }, content: [optimized] },
+  ], config, { alreadyOptimized: (m) => m.role === 'toolResult' && m.toolName === 'context_recall' });
+  const entry = [...combined.imageMetrics.values()][0];
+  assert.equal(entry.originalBytes, png.length);
+  assert.ok(entry.optimizedBytes < png.length);
+}));

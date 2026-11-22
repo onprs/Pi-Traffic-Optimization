@@ -135,8 +135,9 @@ test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、
     { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
     { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_1', name: 'agy_read' }] },
     { role: 'toolResult', toolCallId: 'agy_mcp_1', toolName: 'agy_read', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+    { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
   ]);
-  assert.deepEqual(agyContext.sources.map(item => item.source), ['user image', 'toolResult/read image']);
+  assert.deepEqual(agyContext.sources.map(item => item.source), ['user image', 'toolResult/read image', 'user image']);
 
   const acpPromptPayload = {
     sessionId: 'agy-session-1',
@@ -144,8 +145,9 @@ test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、
       { type: 'text', text: '<workspace_context>\n<cwd>/repo</cwd>\n</workspace_context>' },
       { type: 'text', text: '用户提问' },
       { type: 'image', data, mimeType: 'image/png' },
-      { type: 'text', text: '<assistant model="gemini-4-neon">\n收到。\n</assistant>' },
+      { type: 'text', text: '<assistant model="gemini-4-neon">\n收到。\n<tool_call id="agy_mcp_1" name="agy_read">{"path":"a.ts"}</tool_call>\n</assistant>' },
       { type: 'text', text: '<tool_result id="agy_mcp_1" tool="agy_read" status="ok">\n结果\n</tool_result>' },
+      { type: 'image', data, mimeType: 'image/png' },
       { type: 'image', data, mimeType: 'image/png' },
       { type: 'resource', resource: { uri: 'file:///note.txt', mimeType: 'text/plain', text: '附注' } },
       { type: 'resource_link', uri: 'file:///ref.md', name: 'ref' },
@@ -156,11 +158,12 @@ test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、
   const promptMetrics = analyzePayload('antigravity-acp', acpPromptPayload, agyContext);
   assert.equal(JSON.stringify(acpPromptPayload), beforePrompt);
   assert.equal(promptMetrics.total_payload_bytes, Buffer.byteLength(beforePrompt));
-  for (const key of ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_result_bytes', 'image_payload_bytes']) {
+  for (const key of ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_call_bytes', 'tool_result_bytes', 'image_payload_bytes']) {
     assert.ok(promptMetrics[key] > 0, `antigravity-acp 缺少 ${key}`);
   }
-  assert.deepEqual(promptMetrics.images.map(image => image.source_type), ['user image', 'toolResult/read image']);
+  assert.deepEqual(promptMetrics.images.map(image => image.source_type), ['user image', 'toolResult/read image', 'user image']);
   assert.equal(promptMetrics.images[1].tool_name, 'agy_read');
+  assert.equal(promptMetrics.images[2].tool_name, '');
   assert.equal(promptMetrics.results.length, 1);
   assert.equal(promptMetrics.results[0].tool_name, 'agy_read');
   assert.equal(promptMetrics.results[0].image_bytes, data.length);

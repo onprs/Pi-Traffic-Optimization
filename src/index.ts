@@ -50,7 +50,22 @@ export default async function (pi: ExtensionAPI) {
   let candidate: any;
   let pendingDirectRecord: any;
   let pendingAcpContinuation: any;
+  let pendingAcpGc = false;
+  let acpProjectionDesynced = false;
   let stopObservation: (() => void) | undefined;
+
+  const resetTransientState = () => {
+    context = undefined;
+    imageStats = undefined;
+    imageMetrics = undefined;
+    projectionStats = undefined;
+    candidate = undefined;
+    pendingDirectRecord = undefined;
+    pendingAcpContinuation = undefined;
+    pendingAcpGc = false;
+    acpProjectionDesynced = false;
+    waiting.length = 0;
+  };
 
   const updateStatus = (ui: { setStatus: (key: string, text: string | undefined) => void } | undefined) => {
     ui?.setStatus(STATUS_KEY, `累计上传 ${toMiB(uploadedBytes)} | 当前 ${toMiB(currentBytes)} | 图片压缩率 ${percent(originalImageBytes - sentImageBytes, originalImageBytes)}`);
@@ -63,13 +78,7 @@ export default async function (pi: ExtensionAPI) {
     memory.config = { ...readConfig(configPath), enabled: next };
     registerRecall();
     if (!next) {
-      context = undefined;
-      imageStats = undefined;
-      imageMetrics = undefined;
-      candidate = undefined;
-      pendingDirectRecord = undefined;
-      pendingAcpContinuation = undefined;
-      waiting.length = 0;
+      resetTransientState();
     } else {
       installObservation();
     }
@@ -112,6 +121,11 @@ export default async function (pi: ExtensionAPI) {
     if (result.image_count > 0) {
       if (request.imageMetrics?.size) {
         for (const image of result.images) {
+          if (request.reusedImageHashes?.has(image.image_hash)) {
+            originalImageBytes += image.decoded_bytes;
+            sentImageBytes += image.decoded_bytes;
+            continue;
+          }
           const matched = request.imageMetrics.get(image.image_hash);
           originalImageBytes += matched?.originalBytes ?? image.decoded_bytes;
           sentImageBytes += matched?.optimizedBytes ?? image.decoded_bytes;
@@ -129,22 +143,30 @@ export default async function (pi: ExtensionAPI) {
   // 提取 antigravity-acp 活跃轮次中待通过宿主 MCP 回传的末尾工具结果（与桥接侧 agy_mcp_ 调用编号对齐）。
   const extractAcpMcpToolResults = (messages: any[]) => {
     const results: any[] = [];
+    const reusedImageHashes = new Set<string>();
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message?.role !== 'toolResult') break;
       if (typeof message.toolCallId === 'string' && message.toolCallId.startsWith('agy_mcp_')) {
+        const isRecallReuse = message.toolName === 'context_recall' && !!message.details?.contextId;
+        const content = (Array.isArray(message.content) ? message.content : []).map((block: any) => {
+          if (block?.type === 'image') {
+            if (isRecallReuse && typeof block.data === 'string') {
+              try { reusedImageHashes.add(createHash('sha256').update(block.data, 'base64').digest('hex')); } catch { /* 忽略无效 base64。 */ }
+            }
+            return { type: 'image', data: block.data, mimeType: block.mimeType };
+          }
+          return { type: 'text', text: typeof block?.text === 'string' ? block.text : '' };
+        });
         results.unshift({
           toolCallId: message.toolCallId,
           toolName: message.toolName,
           isError: Boolean(message.isError),
-          content: (Array.isArray(message.content) ? message.content : []).map((block: any) =>
-            block?.type === 'image'
-              ? { type: 'image', data: block.data, mimeType: block.mimeType }
-              : { type: 'text', text: typeof block?.text === 'string' ? block.text : '' }),
+          content,
         });
       }
     }
-    return results;
+    return { results, reusedImageHashes };
   };
 
   const installObservation = () => {
@@ -234,12 +256,17 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on('session_start', async (_event, ctx) => {
+    resetTransientState();
     if (enabled) { installObservation(); reporter.start(); }
     try { await memory.start(ctx); } catch { memory.metrics.failures++; }
     if (ctx.hasUI) updateStatus(ctx.ui);
   });
   pi.on('session_tree', async (_event, ctx) => {
+    resetTransientState();
     try { await memory.start(ctx); } catch { memory.metrics.failures++; }
+  });
+  pi.on('model_select', () => {
+    resetTransientState();
   });
   pi.on('turn_start', () => { memory.setTurn(); });
   pi.on('tool_call', async (event, ctx) => {
@@ -251,7 +278,9 @@ export default async function (pi: ExtensionAPI) {
   });
   pi.on('context_with_system', async (event, ctx) => {
     if (!enabled) return;
-    imageStats = undefined; imageMetrics = undefined; projectionStats = undefined; pendingAcpContinuation = undefined;
+    imageStats = undefined; imageMetrics = undefined; projectionStats = undefined; pendingAcpContinuation = undefined; pendingAcpGc = false;
+    const isDirectModel = Boolean(ctx?.model && isDirectPayloadApi(ctx.model.api));
+    if (!isDirectModel) acpProjectionDesynced = false;
     const config = { ...readConfig(configPath), enabled: true };
     memory.config = config;
     let projected = event.messages;
@@ -259,6 +288,7 @@ export default async function (pi: ExtensionAPI) {
       if (!pi.getActiveTools || pi.getActiveTools().includes('context_recall')) {
         const result = await memory.project(event.messages, ctx);
         projected = result.messages; projectionStats = result.stats;
+        if (isDirectModel && projectionStats?.gcTriggered) pendingAcpGc = true;
       } else {
         memory.last = { skipped: 'recall_inactive' };
       }
@@ -270,11 +300,12 @@ export default async function (pi: ExtensionAPI) {
       imageStats = stats;
       imageMetrics = pairs;
       context = sourcesFromContext(messages);
-      if (ctx?.model && isDirectPayloadApi(ctx.model.api)) {
-        const toolResults = extractAcpMcpToolResults(messages);
+      if (isDirectModel) {
+        const { results: toolResults, reusedImageHashes } = extractAcpMcpToolResults(messages);
         if (toolResults.length > 0) {
           pendingAcpContinuation = {
             payload: { toolResults },
+            reusedImageHashes,
             context, imageStats: stats, imageMetrics: pairs, projectionStats,
             provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
             api: ctx.model.api, baseUrl: ctx.model.baseUrl,
@@ -315,6 +346,7 @@ export default async function (pi: ExtensionAPI) {
     // 第一版保留原生 compact，不取消也不替换其结果。
   });
   pi.on('session_compact', (event) => {
+    resetTransientState();
     if (enabled) {
       memory.compactSinceProjection = true;
       memory.onCompact();
@@ -345,6 +377,8 @@ export default async function (pi: ExtensionAPI) {
         ui: ctx.hasUI ? ctx.ui : undefined,
       };
       if (isDirectPayloadApi(model.api)) {
+        pendingAcpGc = false;
+        acpProjectionDesynced = false;
         pendingDirectRecord = recordRequest({
           request,
           endpoint: model.baseUrl || 'acp://antigravity-cli',
@@ -376,7 +410,11 @@ export default async function (pi: ExtensionAPI) {
     }
     try {
       if (event.message.role !== 'assistant') return;
-      memory.observeAssistantMessage(event.message);
+      if (pendingAcpGc) {
+        acpProjectionDesynced = true;
+        pendingAcpGc = false;
+      }
+      memory.observeAssistantMessage(event.message, { skipCalibration: acpProjectionDesynced });
       candidate = undefined;
       pendingDirectRecord = undefined;
       const continuation = pendingAcpContinuation;
@@ -407,9 +445,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on('session_shutdown', async (_event, ctx) => {
     enabled = false;
     memory.config.enabled = false;
-    pendingDirectRecord = undefined;
-    pendingAcpContinuation = undefined;
-    imageMetrics = undefined;
+    resetTransientState();
     try { await reporter.close(); } catch { /* 报告故障不能阻止退出。 */ }
     try { await memory.close(); } catch { /* 归档故障不能阻止退出。 */ }
     stopObservation?.();

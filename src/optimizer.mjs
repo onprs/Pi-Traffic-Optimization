@@ -298,7 +298,8 @@ export class ImageOptimizer {
           const buffer = Buffer.from(item.data, 'base64');
           const size = buffer.length;
           stats.images++; stats.originalBytes += size; stats.optimizedBytes += size; stats.archiveReuses++;
-          imageMetrics.set(sha256(buffer), { originalBytes: size, optimizedBytes: size });
+          const hash = sha256(buffer);
+          if (!imageMetrics.has(hash)) imageMetrics.set(hash, { originalBytes: size, optimizedBytes: size });
           content.push(item);
         } else content.push(await this.optimizeImage(item, config, stats, imageMetrics));
       }

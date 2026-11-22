@@ -215,9 +215,10 @@ export class ContextArchive {
     this.db.prepare('INSERT OR REPLACE INTO projections VALUES (?,?,?,?)').run(session, source, id, placeholder);
   }
   markStale(path, currentHash) {
-    for (const row of this.db?.prepare("SELECT metadata FROM objects WHERE path=? AND kind='tool' AND tool='read'").all(path) ?? []) {
+    for (const row of this.db?.prepare("SELECT metadata FROM objects WHERE path=? AND kind='tool' AND tool IN ('read','agy_read')").all(path) ?? []) {
       const o = parse(row);
       if (!o) continue;
+      if (currentHash && !o.fileHashAtRead) continue;
       const stale = currentHash ? o.fileHashAtRead !== currentHash : true;
       if (Boolean(o.stale) !== stale) {
         o.stale = stale;

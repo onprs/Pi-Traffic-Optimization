@@ -371,6 +371,9 @@ test('pi-antigravity-bridge 镜像工具：agy_edit 多文件失效旧 read、ag
     content: [{ type: 'text', text: 'Updated a.ts and b.ts' }],
     details: { path: fileA, diffs: [{ path: fileA, oldText: '1', newText: '2' }, { path: fileB, oldText: '1', newText: '2' }] },
   }, ctx);
+  const agyEditObj = memory.results.get('ae-1').object;
+  assert.ok(agyEditObj.related.some(e => e.relation === 'same_file' && e.id === objA.id));
+  assert.ok(agyEditObj.related.some(e => e.relation === 'same_file' && e.id === objB.id));
   assert.ok(memory.working.modifiedFiles[fileA]);
   assert.ok(memory.working.modifiedFiles[fileB]);
   assert.equal(memory.archive.get(objA.id).stale, true);
@@ -378,15 +381,32 @@ test('pi-antigravity-bridge 镜像工具：agy_edit 多文件失效旧 read、ag
   const recalledA = JSON.parse((await memory.recall({ id: objA.id })).content[0].text);
   assert.equal(recalledA.snapshot.state, 'stale');
 
-  // 3. agy_read 归档标记为 source_unverified，纳入 recentReads 并支持 view=current
-  await memory.observeCall({ toolCallId: 'ar-1', toolName: 'agy_read', input: { path: fileA, line: 1 } }, ctx);
-  await memory.observeResult({ toolCallId: 'ar-1', toolName: 'agy_read', input: { path: fileA, line: 1 }, content: [{ type: 'text', text: 'const a = 2;\n' }] }, ctx);
+  // 3. agy_read 归档标记为 source_unverified，支持 details.line 回退、纳入 recentReads 并支持 view=current
+  await writeFile(fileA, 'line1\nconst a = 2;\n');
+  await memory.observeCall({ toolCallId: 'ar-1', toolName: 'agy_read', input: { path: fileA } }, ctx);
+  await memory.observeResult({
+    toolCallId: 'ar-1', toolName: 'agy_read', input: { path: fileA },
+    details: { path: fileA, line: 2 },
+    content: [{ type: 'text', text: 'const a = 2;\n' }],
+  }, ctx);
   const agyReadObj = memory.results.get('ar-1').object;
   assert.equal(agyReadObj.snapshotStatus, 'source_unverified');
+  assert.equal(agyReadObj.range.offset, 2);
   assert.equal(memory.working.recentReads[fileA].id, agyReadObj.id);
+  // 同文件执行带 hash 校验的 read 不应误标未修改时的 agy_read 为 stale
+  await memory.observeCall({ toolCallId: 'r-a2', toolName: 'read', input: { path: fileA } }, ctx);
+  await memory.observeResult({ toolCallId: 'r-a2', toolName: 'read', input: { path: fileA }, content: [{ type: 'text', text: 'line1\nconst a = 2;\n' }] }, ctx);
+  await memory.recall({ id: memory.results.get('r-a2').object.id, metadataOnly: true });
+  assert.notEqual(memory.archive.get(agyReadObj.id).stale, true);
   const liveA = JSON.parse((await memory.recall({ id: agyReadObj.id, view: 'current' })).content[0].text);
   assert.equal(liveA.snapshot.state, 'unverified');
-  assert.match(liveA.text, /const a = 2;/);
+  assert.match(liveA.text, /^1: const a = 2;/);
+  // 后续 edit 修改 fileA 后，agy_read 也应被 markStale 标记为 stale
+  await writeFile(fileA, 'line1\nconst a = 3;\n');
+  await memory.observeResult({ toolCallId: 'ae-2', toolName: 'agy_edit', input: { path: fileA }, isError: false, content: [{ type: 'text', text: 'Updated a.ts' }] }, ctx);
+  assert.equal(memory.archive.get(agyReadObj.id).stale, true);
+  const staleAgyRead = JSON.parse((await memory.recall({ id: agyReadObj.id })).content[0].text);
+  assert.equal(staleAgyRead.snapshot.state, 'stale');
 
   // 4. agy_bash 执行测试，建立 runs_after_edit 关系并记录至 latestTests
   await memory.observeCall({ toolCallId: 'ab-1', toolName: 'agy_bash', input: { command: 'npm test' } }, ctx);
@@ -395,7 +415,7 @@ test('pi-antigravity-bridge 镜像工具：agy_edit 多文件失效旧 read、ag
   assert.ok(agyBashObj.related.some(e => e.relation === 'runs_after_edit'));
   assert.ok(memory.working.latestTests[agyBashObj.id]);
 
-  // 5. 多工具并发分摊切片的极小 input 不应拉低已校准的 calibrationFactor
+  // 5. 多工具并发分摊切片与 skipCalibration（热轮次中途 GC 脱节）均不应污染 calibrationFactor
   const agyCtx = { ...ctx, model: { provider: 'antigravity', id: 'gemini-4-neon', contextWindow: 1048576 } };
   const big = '中'.repeat(24000);
   const history = [assistant('c1'), result('c1', big), ...tail(6)];
@@ -413,4 +433,10 @@ test('pi-antigravity-bridge 镜像工具：agy_edit 多文件失效旧 read、ag
     usage: { input: 60, cacheRead: 240, cacheWrite: 0, output: 20 },
   });
   assert.equal(memory.calibrationFactor, calibrated, '多工具分摊切片不应污染校准系数');
+  await memory.project(history, agyCtx);
+  memory.observeAssistantMessage({
+    role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse',
+    usage: { input: 10000, cacheRead: 90000, cacheWrite: 0, output: 100 },
+  }, { skipCalibration: true });
+  assert.equal(memory.calibrationFactor, calibrated, 'skipCalibration 时不应污染校准系数');
 }, { keepRecentTurns: 4, keepRecentTokens: 12000, minimumToolResultBytes: 4096, oversizedToolResultBytes: 32768 }));

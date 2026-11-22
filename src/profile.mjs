@@ -309,13 +309,20 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
                 activeResult = results.at(-1);
               } else if (/^<assistant\b[^>]*>[\s\S]*<\/assistant>$/.test(item.text)) {
                 activeResult = undefined;
-                addText('assistant_text_bytes', item.text);
+                let cursor = 0;
+                for (const match of item.text.matchAll(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/g)) {
+                  if (match.index > cursor) addText('assistant_text_bytes', item.text.slice(cursor, match.index));
+                  addText('tool_call_bytes', match[0]);
+                  cursor = match.index + match[0].length;
+                }
+                if (cursor < item.text.length) addText('assistant_text_bytes', item.text.slice(cursor));
               } else {
                 activeResult = undefined;
                 addText('user_text_bytes', item.text);
               }
             }
           } else if (item.type === 'image') {
+            if (sourceImages.get(item.data)?.[0]?.source === 'user image') activeResult = undefined;
             const beforeImage = parts.image_payload_bytes;
             addBase64(item.data, item.mimeType, activeResult?.tool_name);
             if (activeResult) activeResult.image_bytes += parts.image_payload_bytes - beforeImage;

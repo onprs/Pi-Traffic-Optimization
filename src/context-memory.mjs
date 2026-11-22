@@ -68,9 +68,9 @@ export class ContextMemory {
     this.lastCalibrationSample = undefined;
     try { this.saveSessionState(); } catch { /* 故障时忽略辅助状态持久化。 */ }
   }
-  observeAssistantMessage(message) {
+  observeAssistantMessage(message, { skipCalibration = false } = {}) {
     if (!this.enabled || message?.role !== 'assistant') return;
-    if (message.stopReason === 'aborted' || message.stopReason === 'error') {
+    if (skipCalibration || message.stopReason === 'aborted' || message.stopReason === 'error') {
       this.lastCalibrationSample = undefined;
       return;
     }
@@ -237,7 +237,12 @@ export class ContextMemory {
     if (call.parentToolCallId) related.push({ id: `call:${this.sessionId}:${call.parentToolCallId}`, relation: 'nested_in' });
     for (const id of this.recallParents.get(source) ?? []) related.push({ id, relation: 'recalls' });
     for (const id of this.children.get(source) ?? []) related.push({ id, relation: 'contains_nested_result' });
-    if (path && this.working.recentReads[path]) related.push({ id: this.working.recentReads[path].id, relation: 'same_file' });
+    const seenSameFile = new Set();
+    for (const relatedPath of [path, ...editedPaths]) {
+      if (!relatedPath || seenSameFile.has(relatedPath)) continue;
+      seenSameFile.add(relatedPath);
+      if (this.working.recentReads[relatedPath]) related.push({ id: this.working.recentReads[relatedPath].id, relation: 'same_file' });
+    }
     if ((EDIT_TOOLS.has(message.toolName) || editedPaths.length > 0) && this.lastFailure) related.push({ id: this.lastFailure, relation: 'after_failure' });
     if (SHELL_TOOLS.has(message.toolName) && this.lastEdit) related.push({ id: this.lastEdit, relation: 'runs_after_edit' });
     const content = [];
@@ -299,7 +304,10 @@ export class ContextMemory {
       durationSeconds: structured.wall_time_seconds ?? (call.startedAt ? (this.clock() - call.startedAt) / 1000 : null),
       range: message.toolName === 'read'
         ? { offset: input.offset ?? 1, limit: input.limit ?? null }
-        : message.toolName === 'agy_read' ? { offset: input.line ?? 1, limit: null } : undefined,
+        : message.toolName === 'agy_read'
+          ? { offset: Number.isSafeInteger(input.line) && input.line >= 1 ? input.line
+            : Number.isSafeInteger(message.details?.line) && message.details.line >= 1 ? message.details.line : 1, limit: null }
+          : undefined,
       fileHashAtRead, snapshotHash: hash(originalText), snapshotStatus,
       query, paths: input.paths ?? input.path ?? message.details?.path,
       matchCount: typeof structured.match_count === 'number' ? structured.match_count : null,
@@ -800,7 +808,11 @@ export class ContextMemory {
 
   async snapshotStatus(o) {
     if (!READ_TOOLS.has(o.toolName) || !o.path) return undefined;
-    if (!o.fileHashAtRead) return { state: 'unverified', message: '历史 read 的文件 hash 无法验证；此内容仅代表当时返回的 snapshot。' };
+    if (!o.fileHashAtRead) {
+      return o.stale
+        ? { state: 'stale', message: '此文件在本会话读取后已被修改；返回的是历史 snapshot，可指定 view=current 读取当前文件。' }
+        : { state: 'unverified', message: '历史 read 的文件 hash 无法验证；此内容仅代表当时返回的 snapshot。' };
+    }
     const current = await this.version(o.path);
     const same = current.status === 'verified' && current.hash === o.fileHashAtRead;
     if (current.status === 'verified') { this.archive.markStale(o.path, current.hash); o.stale = !same; }
