@@ -121,7 +121,19 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
   const addOpaque = (value) => {
     if (typeof value === 'string') opaqueReasoningBytes += encodedStringBytes(value);
   };
-  const addBase64 = (b64, mime, toolName) => {
+  const isReadToolName = (name) => name === 'read' || name === 'agy_read';
+  const takeImageSource = (b64, preferredSource) => {
+    const list = sourceImages.get(b64);
+    if (preferredSource) {
+      if (list?.length) {
+        const index = list.findIndex((item) => item.source === preferredSource);
+        if (index >= 0) return list.splice(index, 1)[0];
+      }
+      return { source: preferredSource };
+    }
+    return list?.shift();
+  };
+  const addBase64 = (b64, mime, toolName, preferredSource) => {
     if (typeof b64 !== 'string' || typeof mime !== 'string' || !mime.startsWith('image/') || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return;
     let sha256 = hashCache.get(b64);
     if (!sha256) {
@@ -138,7 +150,7 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
       }
     }
     const decoded = Buffer.byteLength(b64, 'base64');
-    const source = sourceImages.get(b64)?.shift();
+    const source = takeImageSource(b64, preferredSource);
     images.push({ image_hash: sha256, mime_type: mime, decoded_bytes: decoded,
       base64_bytes: b64.length, image_payload_bytes: b64.length,
       source_type: source?.source ?? 'unknown', repeated: seen.has(sha256), tool_name: toolName ?? '' });
@@ -291,46 +303,91 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
         }
       }
       break;
-    case 'acp':
+    case 'acp': {
+      const analyzeAssistantBlock = (block) => {
+        let cursor = 0;
+        for (const match of block.matchAll(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/g)) {
+          if (match.index > cursor) addText('assistant_text_bytes', block.slice(cursor, match.index));
+          addText('tool_call_bytes', match[0]);
+          cursor = match.index + match[0].length;
+        }
+        if (cursor < block.length) addText('assistant_text_bytes', block.slice(cursor));
+      };
+      const analyzeAcpText = (text) => {
+        if (/^\s*<(?:workspace_context|task_instructions)>[\s\S]*<\/(?:workspace_context|task_instructions)>\s*$/.test(text)) {
+          addText('system_bytes', text);
+          return undefined;
+        }
+        const wholeToolMatch = /^\s*<tool_result\b([^>]*)>[\s\S]*<\/tool_result>\s*$/.exec(text);
+        if (wholeToolMatch) {
+          const nameMatch = /\btool="([^"]+)"/.exec(wholeToolMatch[1]);
+          const toolName = nameMatch?.[1] ?? 'unknown';
+          result(toolName, () => addText('tool_result_bytes', text));
+          return results.at(-1);
+        }
+        if (/^\s*<assistant\b[^>]*>[\s\S]*<\/assistant>\s*$/.test(text)) {
+          analyzeAssistantBlock(text);
+          return undefined;
+        }
+        const tagPattern = /<(workspace_context|task_instructions)>[\s\S]*?<\/\1>|<tool_result\b([^>]*)>[\s\S]*?<\/tool_result>|<assistant\b[^>]*>[\s\S]*?<\/assistant>/g;
+        let cursor = 0;
+        let trailingResult;
+        for (const match of text.matchAll(tagPattern)) {
+          if (match.index > cursor) addText('user_text_bytes', text.slice(cursor, match.index));
+          const chunk = match[0];
+          if (match[1]) {
+            addText('system_bytes', chunk);
+            trailingResult = undefined;
+          } else if (match[2] !== undefined) {
+            const nameMatch = /\btool="([^"]+)"/.exec(match[2]);
+            const toolName = nameMatch?.[1] ?? 'unknown';
+            result(toolName, () => addText('tool_result_bytes', chunk));
+            trailingResult = results.at(-1);
+          } else {
+            analyzeAssistantBlock(chunk);
+            trailingResult = undefined;
+          }
+          cursor = match.index + chunk.length;
+        }
+        if (cursor < text.length) {
+          const tail = text.slice(cursor);
+          addText('user_text_bytes', tail);
+          if (tail.trim().length > 0) trailingResult = undefined;
+        }
+        return trailingResult;
+      };
+      if (Array.isArray(payload.preloadedTurns)) {
+        for (const turn of payload.preloadedTurns) {
+          if (!turn || typeof turn !== 'object') continue;
+          if (typeof turn.userText === 'string') analyzeAcpText(turn.userText);
+          if (typeof turn.assistantAckText === 'string') addText('assistant_text_bytes', turn.assistantAckText);
+        }
+      }
       if (Array.isArray(payload.prompt)) {
         let activeResult;
         for (const item of payload.prompt) {
           if (!item) continue;
           if (item.type === 'text' && typeof item.text === 'string') {
-            if (/^<(?:workspace_context|task_instructions)>[\s\S]*<\/(?:workspace_context|task_instructions)>$/.test(item.text)) {
-              activeResult = undefined;
-              addText('system_bytes', item.text);
-            } else {
-              const toolMatch = /^<tool_result\b([^>]*)>[\s\S]*<\/tool_result>$/.exec(item.text);
-              if (toolMatch) {
-                const nameMatch = /\btool="([^"]+)"/.exec(toolMatch[1]);
-                const toolName = nameMatch?.[1] ?? 'unknown';
-                result(toolName, () => addText('tool_result_bytes', item.text));
-                activeResult = results.at(-1);
-              } else if (/^<assistant\b[^>]*>[\s\S]*<\/assistant>$/.test(item.text)) {
+            activeResult = analyzeAcpText(item.text);
+          } else if (item.type === 'image') {
+            const queue = sourceImages.get(item.data);
+            let preferredSource = 'user image';
+            if (activeResult) {
+              if (queue?.[0]?.source === 'user image') {
                 activeResult = undefined;
-                let cursor = 0;
-                for (const match of item.text.matchAll(/<tool_call\b[^>]*>[\s\S]*?<\/tool_call>/g)) {
-                  if (match.index > cursor) addText('assistant_text_bytes', item.text.slice(cursor, match.index));
-                  addText('tool_call_bytes', match[0]);
-                  cursor = match.index + match[0].length;
-                }
-                if (cursor < item.text.length) addText('assistant_text_bytes', item.text.slice(cursor));
+                preferredSource = 'user image';
               } else {
-                activeResult = undefined;
-                addText('user_text_bytes', item.text);
+                preferredSource = isReadToolName(activeResult.tool_name) ? 'toolResult/read image' : 'toolResult/other';
               }
             }
-          } else if (item.type === 'image') {
-            if (sourceImages.get(item.data)?.[0]?.source === 'user image') activeResult = undefined;
             const beforeImage = parts.image_payload_bytes;
-            addBase64(item.data, item.mimeType, activeResult?.tool_name);
+            addBase64(item.data, item.mimeType, activeResult?.tool_name, preferredSource);
             if (activeResult) activeResult.image_bytes += parts.image_payload_bytes - beforeImage;
           } else if (item.type === 'resource') {
             activeResult = undefined;
             if (typeof item.resource?.text === 'string') addText('user_text_bytes', item.resource.text);
             if (typeof item.resource?.blob === 'string' && typeof item.resource?.mimeType === 'string' && item.resource.mimeType.startsWith('image/')) {
-              addBase64(item.resource.blob, item.resource.mimeType);
+              addBase64(item.resource.blob, item.resource.mimeType, undefined, 'user image');
             }
           } else {
             activeResult = undefined;
@@ -340,16 +397,18 @@ export function analyzePayload(api, payload, context = {}, seen = new Set(), has
         for (const item of payload.toolResults) {
           if (!item) continue;
           const toolName = item.toolName || calls.get(item.toolCallId) || 'unknown';
+          const preferredSource = isReadToolName(toolName) ? 'toolResult/read image' : 'toolResult/other';
           result(toolName, () => {
             for (const block of item.content ?? []) {
               if (!block) continue;
               if (block.type === 'text') addText('tool_result_bytes', block.text);
-              else if (block.type === 'image') addBase64(block.data, block.mimeType, toolName);
+              else if (block.type === 'image') addBase64(block.data, block.mimeType, toolName, preferredSource);
             }
           });
         }
       }
       break;
+    }
   }
   const categorized = Object.values(parts).reduce((a, b) => a + b, 0);
   parts.other_bytes = total - categorized;

@@ -190,4 +190,42 @@ test('antigravity-acp：session/prompt 与宿主 MCP 工具回传载荷分类、
   assert.equal(mcpMetrics.results[0].image_bytes, data.length);
   assert.equal(mcpMetrics.total_payload_bytes, ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_call_bytes',
     'tool_result_bytes', 'image_payload_bytes', 'tool_schema_bytes', 'other_bytes'].reduce((sum, key) => sum + mcpMetrics[key], 0));
+
+  // 带末尾换行的 <workspace_context>、SQLite preloadedTurns 复合分片与同 base64 增量图片来源归属
+  const wsTrailingNewlinePayload = {
+    sessionId: 'agy-session-preload',
+    preloadedTurns: [
+      {
+        userText: '<workspace_context>\n<cwd>/repo</cwd>\n</workspace_context>\n\n<conversation-checkpoint part="1/1">\n<user>历史问题</user>\n<assistant model="gemini-4-neon">\n<tool_call id="c1" name="read">{"path":"a.ts"}</tool_call>\n</assistant>\n<tool_result id="c1" tool="read" status="ok">\n历史输出\n</tool_result>\n</conversation-checkpoint>',
+        assistantAckText: 'Understood. Historical context segment 1/1 received.',
+      },
+    ],
+    prompt: [
+      { type: 'text', text: '<workspace_context>\n<cwd>/repo</cwd>\n</workspace_context>\n' },
+      { type: 'image', data, mimeType: 'image/png' },
+    ],
+  };
+  const preloadRaw = JSON.stringify(wsTrailingNewlinePayload);
+  const preloadContext = sourcesFromContext([
+    { role: 'toolResult', toolCallId: 'c1', toolName: 'read', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+    { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+  ]);
+  const preloadMetrics = analyzePayload('antigravity-acp', wsTrailingNewlinePayload, preloadContext);
+  assert.equal(preloadMetrics.total_payload_bytes, Buffer.byteLength(preloadRaw));
+  assert.ok(preloadMetrics.system_bytes > 0, '带末尾换行的 <workspace_context> 必须归入 system_bytes');
+  assert.ok(preloadMetrics.tool_call_bytes > 0 && preloadMetrics.tool_result_bytes > 0 && preloadMetrics.assistant_text_bytes > 0);
+  assert.equal(preloadMetrics.images.length, 1);
+  assert.equal(preloadMetrics.images[0].source_type, 'user image', '增量 prompt 中用户图片不应被早期同 base64 工具图片顶替');
+  assert.equal(preloadMetrics.total_payload_bytes, ['system_bytes', 'user_text_bytes', 'assistant_text_bytes', 'tool_call_bytes',
+    'tool_result_bytes', 'image_payload_bytes', 'tool_schema_bytes', 'other_bytes'].reduce((sum, key) => sum + preloadMetrics[key], 0));
+
+  // toolResults 载荷即使历史中先出现同 base64 的 user image，仍应归属 toolResult/read image
+  const reversedContext = sourcesFromContext([
+    { role: 'user', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+    { role: 'toolResult', toolCallId: 'agy_mcp_2', toolName: 'read', content: [{ type: 'image', data, mimeType: 'image/png' }] },
+  ]);
+  const mcpImageMetrics = analyzePayload('antigravity-acp', {
+    toolResults: [{ toolCallId: 'agy_mcp_2', toolName: 'read', isError: false, content: [{ type: 'image', data, mimeType: 'image/png' }] }],
+  }, reversedContext);
+  assert.equal(mcpImageMetrics.images[0].source_type, 'toolResult/read image');
 });

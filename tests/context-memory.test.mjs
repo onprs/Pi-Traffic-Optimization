@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import sharp from 'sharp';
 import { ImageOptimizer } from '../src/optimizer.mjs';
 import { normalizeConfiguration } from '../src/configuration.mjs';
@@ -407,6 +408,30 @@ test('pi-antigravity-bridge 镜像工具：agy_edit 多文件失效旧 read、ag
   assert.equal(memory.archive.get(agyReadObj.id).stale, true);
   const staleAgyRead = JSON.parse((await memory.recall({ id: agyReadObj.id })).content[0].text);
   assert.equal(staleAgyRead.snapshot.state, 'stale');
+
+  // 3b. agy_read 传入 file:// URI、StartLine/EndLine 及带连续行号前缀的快照，diff 不产生整段假差异
+  const fileC = join(directory, 'c.ts');
+  await writeFile(fileC, 'line1\nkeep-2\nchange-3\nkeep-4\nline5\n');
+  const fileCUri = pathToFileURL(fileC).href;
+  await memory.observeCall({ toolCallId: 'ar-uri', toolName: 'agy_read', input: { path: fileCUri, StartLine: 2, EndLine: 4 } }, ctx);
+  await memory.observeResult({
+    toolCallId: 'ar-uri', toolName: 'agy_read', input: { path: fileCUri, StartLine: 2, EndLine: 4 },
+    details: { path: fileCUri, line: 2, limit: 3 },
+    content: [{ type: 'text', text: '2: keep-2\n3: change-3\n4: keep-4' }],
+  }, ctx);
+  const uriReadObj = memory.results.get('ar-uri').object;
+  assert.equal(uriReadObj.path, fileC);
+  assert.deepEqual(uriReadObj.range, { offset: 2, limit: 3 });
+  await writeFile(fileC, 'line1\nkeep-2\nchange-3-new\nkeep-4\nline5\n');
+  await memory.observeResult({
+    toolCallId: 'ae-uri', toolName: 'agy_edit', input: { path: fileCUri }, isError: false,
+    content: [{ type: 'text', text: 'Updated c.ts' }],
+  }, ctx);
+  assert.equal(memory.archive.get(uriReadObj.id).stale, true);
+  const diffC = JSON.parse((await memory.recall({ id: uriReadObj.id, view: 'diff' })).content[0].text);
+  assert.equal(diffC.snapshot.state, 'stale');
+  assert.ok(diffC.text.includes(' keep-2') && diffC.text.includes('-change-3') && diffC.text.includes('+change-3-new') && diffC.text.includes(' keep-4'));
+  assert.equal(diffC.text.includes('line5'), false);
 
   // 4. agy_bash 执行测试，建立 runs_after_edit 关系并记录至 latestTests
   await memory.observeCall({ toolCallId: 'ab-1', toolName: 'agy_bash', input: { command: 'npm test' } }, ctx);

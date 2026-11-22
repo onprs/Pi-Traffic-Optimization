@@ -3,6 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { resolve, normalize } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 const revision = new URL(import.meta.url).search;
 const { ContextArchive, hash, utf8Bytes } = await import(new URL('./archive.mjs' + revision, import.meta.url).href);
@@ -14,6 +15,30 @@ const EDIT_TOOLS = new Set(['edit', 'write', 'agy_edit', 'agy_write']);
 const SHELL_TOOLS = new Set(['bash', 'powershell', 'agy_bash']);
 const signature = (content) => (content ?? []).flatMap(b => b.type === 'image' ? [b.type, b.mimeType, b.data] : [b.type, b.text ?? JSON.stringify(b)]);
 const equal = (a, b) => a?.length === b.length && a.every((v, i) => v === b[i]);
+const positiveInt = (...values) => {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1) return value;
+    if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+      const parsed = Number.parseInt(value.trim(), 10);
+      if (Number.isSafeInteger(parsed) && parsed >= 1) return parsed;
+    }
+  }
+  return undefined;
+};
+const stripSequentialLineNumbers = (snapshotText, startLine = 1) => {
+  const rawLines = snapshotText.split('\n');
+  const hasTrailingEmpty = rawLines.length > 1 && rawLines.at(-1) === '';
+  const bodyLines = hasTrailingEmpty ? rawLines.slice(0, -1) : rawLines;
+  if (!bodyLines.length) return rawLines;
+  const stripped = [];
+  for (let i = 0; i < bodyLines.length; i++) {
+    const match = /^\s*(\d+)(?:: ?|\t)(.*)$/.exec(bodyLines[i]);
+    if (!match || Number.parseInt(match[1], 10) !== startLine + i) return rawLines;
+    stripped.push(match[2]);
+  }
+  if (hasTrailingEmpty) stripped.push('');
+  return stripped;
+};
 const emptyMetrics = () => ({ toolOutputsArchived: 0, toolBytesProjected: 0, imageBlocksProjected: 0,
   imageBytesAvoided: 0, recallCalls: 0, recallBytesReturned: 0, archiveHits: 0, staleSnapshotHits: 0,
   exactRecallsWithoutToolExecution: 0, toolReexecutionAvoided: null, projectionMs: 0, recallMs: 0,
@@ -130,6 +155,11 @@ export class ContextMemory {
   setTurn() { this.turn++; }
   filePath(path, cwd = this.cwd) {
     if (typeof path !== 'string') return undefined;
+    path = path.trim();
+    if (!path) return undefined;
+    if (/^file:\/\//i.test(path)) {
+      try { path = fileURLToPath(path); } catch { /* 无法解析的 file URI 保持原样由后续路径解析兜底。 */ }
+    }
     path = path.replace(/^@/, '').replace(/[\u00a0\u202f]/g, ' ');
     if (path === '~' || path.startsWith('~/') || path.startsWith('~\\')) path = homedir() + path.slice(1);
     return normalize(resolve(cwd, path));
@@ -305,8 +335,13 @@ export class ContextMemory {
       range: message.toolName === 'read'
         ? { offset: input.offset ?? 1, limit: input.limit ?? null }
         : message.toolName === 'agy_read'
-          ? { offset: Number.isSafeInteger(input.line) && input.line >= 1 ? input.line
-            : Number.isSafeInteger(message.details?.line) && message.details.line >= 1 ? message.details.line : 1, limit: null }
+          ? (() => {
+              const offset = positiveInt(input.offset, input.line, input.start_line, input.StartLine, input.startLine, message.details?.line) ?? 1;
+              const explicitLimit = positiveInt(input.limit, message.details?.limit);
+              const endLine = positiveInt(input.EndLine, input.end_line, input.endLine);
+              const limit = explicitLimit ?? (endLine && endLine >= offset ? endLine - offset + 1 : null);
+              return { offset, limit };
+            })()
           : undefined,
       fileHashAtRead, snapshotHash: hash(originalText), snapshotStatus,
       query, paths: input.paths ?? input.path ?? message.details?.path,
@@ -972,7 +1007,10 @@ export class ContextMemory {
           const section = current.slice(start, start + (o.range?.limit ?? this.options.recallOptions.maxPageLines)).join('\n');
           if (params.view === 'current') text = section;
           else {
-            const old = text.split('\n'); const live = section.split('\n');
+            const old = o.toolName === 'agy_read'
+              ? stripSequentialLineNumbers(text, o.range?.offset ?? 1)
+              : text.split('\n');
+            const live = section.split('\n');
             text = old.flatMap((line, i) => line === live[i] ? [` ${line}`] : [`-${line}`, ...(live[i] === undefined ? [] : [`+${live[i]}`])])
               .concat(live.slice(old.length).map(line => '+' + line)).join('\n');
           }

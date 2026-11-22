@@ -47,24 +47,40 @@ export default async function (pi: ExtensionAPI) {
   let context: ReturnType<typeof sourcesFromContext> | undefined;
   let imageStats: { originalBytes: number; optimizedBytes: number } | undefined;
   let imageMetrics: Map<string, { originalBytes: number; optimizedBytes: number }> | undefined;
+  let reusedRecallImageHashes: Set<string> | undefined;
   let candidate: any;
   let pendingDirectRecord: any;
   let pendingAcpContinuation: any;
   let pendingAcpGc = false;
   let acpProjectionDesynced = false;
+  let lastAcpSessionId: string | undefined;
+  let lastAcpRequestState: { prevSessionId: string | undefined; prevDesynced: boolean; record: any } | undefined;
   let stopObservation: (() => void) | undefined;
 
   const resetTransientState = () => {
     context = undefined;
     imageStats = undefined;
     imageMetrics = undefined;
+    reusedRecallImageHashes = undefined;
     projectionStats = undefined;
     candidate = undefined;
     pendingDirectRecord = undefined;
     pendingAcpContinuation = undefined;
     pendingAcpGc = false;
     acpProjectionDesynced = false;
+    lastAcpSessionId = undefined;
+    lastAcpRequestState = undefined;
     waiting.length = 0;
+  };
+
+  const readResponseHeader = (headers: Record<string, string> | undefined, name: string): string | undefined => {
+    if (!headers || typeof headers !== 'object') return undefined;
+    if (typeof headers[name] === 'string') return headers[name];
+    const target = name.toLowerCase();
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === target && typeof value === 'string') return value;
+    }
+    return undefined;
   };
 
   const updateStatus = (ui: { setStatus: (key: string, text: string | undefined) => void } | undefined) => {
@@ -121,7 +137,7 @@ export default async function (pi: ExtensionAPI) {
     if (result.image_count > 0) {
       if (request.imageMetrics?.size) {
         for (const image of result.images) {
-          if (request.reusedImageHashes?.has(image.image_hash)) {
+          if (image.tool_name === 'context_recall' && request.reusedImageHashes?.has(image.image_hash)) {
             originalImageBytes += image.decoded_bytes;
             sentImageBytes += image.decoded_bytes;
             continue;
@@ -140,20 +156,35 @@ export default async function (pi: ExtensionAPI) {
     return record;
   };
 
-  // 提取 antigravity-acp 活跃轮次中待通过宿主 MCP 回传的末尾工具结果（与桥接侧 agy_mcp_ 调用编号对齐）。
+  // 收集本次消息上下文中由 context_recall 复用的已优化图片哈希，避免重复计入图片压缩率统计。
+  const collectReusedRecallImageHashes = (messages: any[]) => {
+    const hashesSet = new Set<string>();
+    for (const message of messages) {
+      if (message?.role !== 'toolResult' || message.toolName !== 'context_recall' || !message.details?.contextId) continue;
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block?.type === 'image' && typeof block.data === 'string') {
+          try { hashesSet.add(createHash('sha256').update(block.data, 'base64').digest('hex')); } catch { /* 忽略无效 base64。 */ }
+        }
+      }
+    }
+    return hashesSet;
+  };
+
+  // 提取 antigravity-acp 活跃轮次中待通过宿主 MCP 回传的末尾工具结果（兼容工具边界 steer 切入时的末尾用户消息）。
   const extractAcpMcpToolResults = (messages: any[]) => {
     const results: any[] = [];
-    const reusedImageHashes = new Set<string>();
-    for (let i = messages.length - 1; i >= 0; i--) {
+    let end = messages.length - 1;
+    let hasTrailingUser = false;
+    while (end >= 0 && messages[end]?.role === 'user') {
+      hasTrailingUser = true;
+      end--;
+    }
+    for (let i = end; i >= 0; i--) {
       const message = messages[i];
       if (message?.role !== 'toolResult') break;
       if (typeof message.toolCallId === 'string' && message.toolCallId.startsWith('agy_mcp_')) {
-        const isRecallReuse = message.toolName === 'context_recall' && !!message.details?.contextId;
         const content = (Array.isArray(message.content) ? message.content : []).map((block: any) => {
           if (block?.type === 'image') {
-            if (isRecallReuse && typeof block.data === 'string') {
-              try { reusedImageHashes.add(createHash('sha256').update(block.data, 'base64').digest('hex')); } catch { /* 忽略无效 base64。 */ }
-            }
             return { type: 'image', data: block.data, mimeType: block.mimeType };
           }
           return { type: 'text', text: typeof block?.text === 'string' ? block.text : '' };
@@ -166,7 +197,7 @@ export default async function (pi: ExtensionAPI) {
         });
       }
     }
-    return { results, reusedImageHashes };
+    return { results, hasTrailingUser };
   };
 
   const installObservation = () => {
@@ -299,13 +330,15 @@ export default async function (pi: ExtensionAPI) {
       });
       imageStats = stats;
       imageMetrics = pairs;
+      reusedRecallImageHashes = collectReusedRecallImageHashes(messages);
       context = sourcesFromContext(messages);
       if (isDirectModel) {
-        const { results: toolResults, reusedImageHashes } = extractAcpMcpToolResults(messages);
+        const { results: toolResults, hasTrailingUser } = extractAcpMcpToolResults(messages);
         if (toolResults.length > 0) {
           pendingAcpContinuation = {
             payload: { toolResults },
-            reusedImageHashes,
+            hasTrailingUser,
+            reusedImageHashes: reusedRecallImageHashes,
             context, imageStats: stats, imageMetrics: pairs, projectionStats,
             provider: ctx.model.provider, model: ctx.model.id, id: ctx.model.id,
             api: ctx.model.api, baseUrl: ctx.model.baseUrl,
@@ -318,6 +351,7 @@ export default async function (pi: ExtensionAPI) {
     } catch {
       context = undefined;
       imageMetrics = undefined;
+      reusedRecallImageHashes = undefined;
       pendingAcpContinuation = undefined;
       return { messages: projected };
     }
@@ -362,6 +396,7 @@ export default async function (pi: ExtensionAPI) {
     if (!enabled) return;
     candidate = undefined;
     pendingDirectRecord = undefined;
+    lastAcpRequestState = undefined;
     pendingAcpContinuation = undefined;
     waiting.length = 0;
     try {
@@ -371,14 +406,25 @@ export default async function (pi: ExtensionAPI) {
       const wireBytes = Buffer.byteLength(body, 'utf8');
       const request = {
         bytes: wireBytes,
-        context, imageStats, imageMetrics, projectionStats, provider: model.provider, model: model.id, id: model.id,
+        context, imageStats, imageMetrics, reusedImageHashes: reusedRecallImageHashes, projectionStats,
+        provider: model.provider, model: model.id, id: model.id,
         api: model.api, baseUrl: model.baseUrl,
         estimated_context_tokens: ctx.getContextUsage()?.tokens ?? null,
         ui: ctx.hasUI ? ctx.ui : undefined,
       };
       if (isDirectPayloadApi(model.api)) {
-        pendingAcpGc = false;
-        acpProjectionDesynced = false;
+        const nextSessionId = typeof (event.payload as any)?.sessionId === 'string'
+          ? (event.payload as any).sessionId as string
+          : undefined;
+        const prevSessionId = lastAcpSessionId;
+        const prevDesynced = acpProjectionDesynced;
+        if (pendingAcpGc) {
+          acpProjectionDesynced = Boolean(lastAcpSessionId && nextSessionId === lastAcpSessionId);
+          pendingAcpGc = false;
+        } else if (acpProjectionDesynced && nextSessionId && nextSessionId !== lastAcpSessionId) {
+          acpProjectionDesynced = false;
+        }
+        if (nextSessionId) lastAcpSessionId = nextSessionId;
         pendingDirectRecord = recordRequest({
           request,
           endpoint: model.baseUrl || 'acp://antigravity-cli',
@@ -387,21 +433,83 @@ export default async function (pi: ExtensionAPI) {
           wireBytes,
           transport: 'acp-stdio',
         });
+        lastAcpRequestState = { prevSessionId, prevDesynced, record: pendingDirectRecord };
       } else {
         candidate = request;
       }
-    } catch { candidate = undefined; pendingDirectRecord = undefined; }
-    finally { context = undefined; imageStats = undefined; imageMetrics = undefined; projectionStats = undefined; }
+    } catch { candidate = undefined; pendingDirectRecord = undefined; lastAcpRequestState = undefined; }
+    finally { context = undefined; imageStats = undefined; imageMetrics = undefined; reusedRecallImageHashes = undefined; projectionStats = undefined; }
   });
   pi.on('after_provider_response', (event) => {
-    if (!enabled || !pendingDirectRecord) return;
+    if (!enabled) return;
     try {
+      const acpTransport = readResponseHeader(event.headers, 'x-acp-transport');
+      if (acpTransport === 'acp-mcp-result') {
+        const sessionId = readResponseHeader(event.headers, 'x-acp-session-id');
+        if (sessionId) lastAcpSessionId = sessionId;
+        const projectionSynced = readResponseHeader(event.headers, 'x-acp-projection-synced');
+        if (projectionSynced === '1') {
+          acpProjectionDesynced = false;
+          pendingAcpGc = false;
+        } else if (projectionSynced === '0') {
+          acpProjectionDesynced = true;
+          pendingAcpGc = false;
+        }
+        const continuation = pendingAcpContinuation;
+        pendingAcpContinuation = undefined;
+        if (continuation) {
+          const settledHeader = readResponseHeader(event.headers, 'x-acp-settled-mcp-ids');
+          const settledIds = settledHeader
+            ? new Set(settledHeader.split(',').map((item) => item.trim()).filter(Boolean))
+            : undefined;
+          const toolResults = settledIds?.size
+            ? continuation.payload.toolResults.filter((item: any) => settledIds.has(item.toolCallId))
+            : continuation.payload.toolResults;
+          if (toolResults.length > 0) {
+            const body = JSON.stringify({ toolResults });
+            const wireBytes = Buffer.byteLength(body, 'utf8');
+            recordRequest({
+              request: { ...continuation, bytes: wireBytes },
+              endpoint: `${continuation.baseUrl || 'acp://antigravity-cli'}/mcp-result`,
+              headers: new Headers(),
+              body,
+              wireBytes,
+              transport: 'acp-mcp-result',
+              initialStatus: typeof event.status === 'number' ? event.status : 200,
+              enqueueWaiting: true,
+            });
+          }
+        }
+        return;
+      }
+      if (!pendingDirectRecord) return;
       if (typeof event.status === 'number') {
         pendingDirectRecord.response_status = event.status;
         save(pendingDirectRecord);
       }
+      const isAux = readResponseHeader(event.headers, 'x-acp-auxiliary') === '1';
+      if (isAux && lastAcpRequestState) {
+        const idx = waiting.indexOf(lastAcpRequestState.record);
+        if (idx >= 0) waiting.splice(idx, 1);
+        lastAcpSessionId = lastAcpRequestState.prevSessionId;
+        acpProjectionDesynced = lastAcpRequestState.prevDesynced;
+      } else {
+        const projectionSynced = readResponseHeader(event.headers, 'x-acp-projection-synced');
+        if (projectionSynced === '1') {
+          acpProjectionDesynced = false;
+          pendingAcpGc = false;
+        } else if (projectionSynced === '0') {
+          acpProjectionDesynced = true;
+          pendingAcpGc = false;
+        }
+      }
     } catch { /* 只读观测。 */ }
-    finally { pendingDirectRecord = undefined; }
+    finally {
+      if (readResponseHeader(event.headers, 'x-acp-transport') !== 'acp-mcp-result') {
+        pendingDirectRecord = undefined;
+        lastAcpRequestState = undefined;
+      }
+    }
   });
   pi.on('message_end', async (event) => {
     if (!enabled) return;
@@ -417,6 +525,7 @@ export default async function (pi: ExtensionAPI) {
       memory.observeAssistantMessage(event.message, { skipCalibration: acpProjectionDesynced });
       candidate = undefined;
       pendingDirectRecord = undefined;
+      lastAcpRequestState = undefined;
       const continuation = pendingAcpContinuation;
       pendingAcpContinuation = undefined;
       const usage = event.message.usage;
@@ -424,8 +533,12 @@ export default async function (pi: ExtensionAPI) {
       const record = waiting.shift();
       if (record) {
         record.context_tokens = contextTokens;
+        if (record.transport === 'acp-mcp-result' && event.message.stopReason === 'error') {
+          const statusMatch = /\b([45]\d\d)\b/.exec(event.message.errorMessage ?? '');
+          record.response_status = statusMatch ? Number(statusMatch[1]) : null;
+        }
         save(record);
-      } else if (continuation && event.message.stopReason !== 'aborted' && event.message.stopReason !== 'error') {
+      } else if (continuation && !continuation.hasTrailingUser && event.message.stopReason !== 'aborted' && event.message.stopReason !== 'error') {
         const body = JSON.stringify(continuation.payload);
         const wireBytes = Buffer.byteLength(body, 'utf8');
         recordRequest({

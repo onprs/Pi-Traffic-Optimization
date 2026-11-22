@@ -321,14 +321,55 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
     await app.command.handler('上下文', app.ctx);
     assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1);
-    // 下一新用户轮次走 before_provider_request（acp-stdio 重建同步）后，恢复正常动态校准
+    // 紧接着复用同一旧 sessionId（且显式返回 x-acp-projection-synced=0）时，继续跳过失真校准
+    await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '复用旧会话' }] });
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-1', prompt: [{ type: 'text', text: '复用旧会话' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-1', 'x-acp-projection-synced': '0' } });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
+    await app.command.handler('上下文', app.ctx);
+    assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1, '复用未瘦身旧会话时不得清零脱节保护');
+
+    // 下一新用户轮次切换新 sessionId 并返回 x-acp-projection-synced=1 后，恢复正常动态校准
     await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '下一轮' }] });
     app.emit('before_provider_request', { payload: { sessionId: 'agy-2', prompt: [{ type: 'text', text: '下一轮' }] } });
-    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-2' } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-2', 'x-acp-projection-synced': '1' } });
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 35000, cacheWrite: 0 } } });
     await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '确认校准' }] });
     await app.command.handler('上下文', app.ctx);
     assert.ok(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor > 1.2, '同步重建后应恢复正常动态校准');
+
+    // 工具边界 steer 切入：经 after_provider_response(x-acp-transport=acp-mcp-result) 记账工具回传，随后再记账 steer session/prompt
+    const steerMessages = [
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_steer_1', name: 'read', arguments: { path: 'a.ts' } }] },
+      { role: 'toolResult', toolCallId: 'agy_mcp_steer_1', toolName: 'read', isError: false, content: [{ type: 'text', text: 'steer 前工具输出' }] },
+      { role: 'user', content: '转向新指令' },
+    ];
+    await app.emit('context_with_system', { messages: steerMessages });
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: { 'x-acp-session-id': 'agy-2', 'x-acp-transport': 'acp-mcp-result', 'x-acp-settled-mcp-ids': 'agy_mcp_steer_1' },
+    });
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-2', prompt: [{ type: 'text', text: '转向新指令' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-2', 'x-acp-projection-synced': '1' } });
+    await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 500, cacheRead: 0, cacheWrite: 0 } } });
+
+    // MCP 回传后上游返回 429 error：仍保留已发出的 acp-mcp-result 记录并标注状态 429
+    const errMcpMessages = [
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'agy_mcp_err_1', name: 'read', arguments: { path: 'b.ts' } }] },
+      { role: 'toolResult', toolCallId: 'agy_mcp_err_1', toolName: 'read', isError: false, content: [{ type: 'text', text: '触发限流的工具输出' }] },
+    ];
+    await app.emit('context_with_system', { messages: errMcpMessages });
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: { 'x-acp-session-id': 'agy-2', 'x-acp-transport': 'acp-mcp-result', 'x-acp-settled-mcp-ids': 'agy_mcp_err_1' },
+    });
+    await app.emit('message_end', {
+      message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'error', errorMessage: 'Antigravity quota exhausted (429): limit', usage: { input: 0, cacheRead: 0, cacheWrite: 0 } },
+    });
+
+    // 辅助请求（x-acp-auxiliary=1）记入流量报告但不压入主会话 waiting 队列
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-aux-1', prompt: [{ type: 'text', text: '<task_instructions>\ncompact\n</task_instructions>' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-aux-1', 'x-acp-auxiliary': '1' } });
 
     // model_select 清理瞬态请求状态，避免误记上一轮残余 continuation
     await app.emit('context_with_system', { messages: step2Messages });
@@ -336,7 +377,9 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10, cacheRead: 0, cacheWrite: 0 } } });
     await app.emit('agent_settled');
     const summaryAfter = JSON.parse(await readFile(join(report, 'summary.json'), 'utf8'));
-    assert.equal(summaryAfter.request_count, 6, 'model_select 后不应误记残留的 acp-mcp-result');
+    assert.equal(summaryAfter.request_count, 11, '应精确记录旧会话复用、重建、steer 切入双记账、429 错误 MCP 与辅助请求且不误记残留');
+    assert.ok(summaryAfter.requests.some((r) => r.transport === 'acp-mcp-result' && r.response_status === 429));
+    assert.ok(summaryAfter.requests.some((r) => r.transport === 'acp-stdio' && r.system_bytes > 0));
     await app.emit('session_shutdown');
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {
