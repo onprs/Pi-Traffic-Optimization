@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "models": {},
   "skipBelowKB": 300,
   "maxLongEdge": 1920,
   "targetKB": 375,

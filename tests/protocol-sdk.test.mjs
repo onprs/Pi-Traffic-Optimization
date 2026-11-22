@@ -148,7 +148,7 @@ async function runProtocol({ sdk, root, api, directory, workspace, fixture }) {
     if (callbackError) throw callbackError;
     assert.deepEqual(errors, [], `${api} provider 响应应被正常解析`);
     assert.equal(requests.length, 1, `${api} 应只发送一次请求`);
-    await session.prompt('/traffic-opt 统计');
+    await session.prompt('/traffic-opt stats');
     const summary = JSON.parse(await readFile(join(directory, 'report/summary.json'), 'utf8'));
     assert.equal(summary.request_count, 1, `${api} 应记录实际请求`);
     assert.equal(summary.total_upload_bytes, requests[0].body.length);
@@ -329,7 +329,7 @@ test('Pi SDK：antigravity-acp 自定义 streamSimple provider 的投影契约�
     assert.ok(toolResultBlock);
     assert.match(toolResultBlock.text, /\n\[已归档 ctx:\/\/tool\/[a-f0-9]{16,64}\]/);
 
-    await session.prompt('/traffic-opt 统计');
+    await session.prompt('/traffic-opt stats');
     const summary = JSON.parse(await readFile(join(directory, 'report/summary.json'), 'utf8'));
     assert.equal(summary.request_count, 1);
     const serialized = Buffer.from(JSON.stringify(observedPayloads[0]), 'utf8');

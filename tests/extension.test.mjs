@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import register from '../src/index.ts';
+import { normalizeConfiguration, modelKey, isModelAllowed, isModelEnabled } from '../src/configuration.mjs';
 
 const endpoint = 'https://example.test/v1/responses';
 const asMiB = (bytes) => `${(bytes / 1048576).toFixed(3)} MiB`;
@@ -14,26 +15,31 @@ const asMiB = (bytes) => `${(bytes / 1048576).toFixed(3)} MiB`;
 async function harness(options = {}) {
   const handlers = new Map();
   const commands = new Map();
+  const tools = new Map();
   const statuses = [];
   const notices = [];
   let activeTools = options.activeTools;
   const ctx = {
-    hasUI: true, mode: 'rpc',
+    hasUI: options.hasUI ?? true,
+    mode: options.mode ?? 'rpc',
     model: options.model ?? { baseUrl: 'https://example.test/v1', provider: 'test', id: 'test', api: 'openai-responses' },
+    modelRegistry: options.modelRegistry,
     getContextUsage: () => ({ tokens: 1 }),
     ui: {
       setStatus: (key, value) => { assert.equal(key, '00-traffic-optimization'); statuses.push(value); },
       notify: (...args) => notices.push(args),
+      ...(options.select ? { select: options.select } : {}),
     },
   };
   await register({
     on: (event, handler) => handlers.set(event, handler),
     registerCommand: (name, command) => commands.set(name, command),
-    registerTool: () => {},
+    registerTool: (tool) => tools.set(tool.name, tool),
     ...(activeTools !== undefined ? { getActiveTools: () => activeTools } : {}),
   });
   return {
-    ctx, statuses, notices, command: commands.get('traffic-opt'),
+    ctx, statuses, notices, tools, command: commands.get('traffic-opt'),
+    setModel: (next) => { ctx.model = next; },
     setActiveTools: (next) => { activeTools = next; },
     emit: (event, value = {}) => handlers.get(event)?.(value, ctx),
   };
@@ -96,8 +102,15 @@ test('统一开关、补全、图片优化和实际请求统计在同一扩展�
   try {
     const app = await harness();
     assert.ok(app.command);
-    assert.deepEqual(app.command.getArgumentCompletions('清'), [{ value: '清理缓存', label: '清理缓存' }]);
-    assert.deepEqual(app.command.getArgumentCompletions('关'), [{ value: '关', label: '关' }]);
+    assert.deepEqual(
+      app.command.getArgumentCompletions('clear')?.map(item => item.value),
+      ['clear-cache'],
+    );
+    assert.deepEqual(
+      app.command.getArgumentCompletions('o')?.map(item => item.value),
+      ['on', 'off'],
+    );
+    assert.equal(app.command.getArgumentCompletions('开'), null);
     await app.emit('session_start');
     assert.notEqual(globalThis.fetch, originalFetch);
     assert.match(app.statuses.at(-1), /^累计上传 0.000 MiB \| 当前 0.000 MiB \| 图片压缩率 0.0%$/);
@@ -143,16 +156,18 @@ test('统一开关、补全、图片优化和实际请求统计在同一扩展�
     await globalThis.fetch(endpoint, { method: 'POST', body: JSON.stringify(textOnly) });
     assert.ok(app.statuses.at(-1).endsWith(`图片压缩率 ${imageRate}`));
 
-    const displayedMetrics = app.statuses.at(-1);
-    await app.command.handler('关', app.ctx);
+    await app.command.handler('off', app.ctx);
     assert.equal(JSON.parse(await readFile(config, 'utf8')).enabled, false);
     assert.equal(JSON.parse(await readFile(config, 'utf8')).skipBelowKB, 0);
-    assert.equal(app.statuses.at(-1), displayedMetrics);
+    assert.equal(app.statuses.at(-1).includes('图片压缩率'), false, '关闭优化后状态栏应仅显示流量统计');
+    assert.match(app.statuses.at(-1), /^累计上传 [\d.]+ MiB \| 当前 [\d.]+ MiB$/);
+    assert.match(app.notices.at(-1)[0], /已关闭/);
     assert.equal(await app.emit('context_with_system', { messages }), undefined);
     await globalThis.fetch(endpoint, { method: 'POST', body });
     await app.emit('agent_settled');
     assert.equal((await readFile(join(report, 'summary.json'), 'utf8')).includes('"request_count": 3'), true);
-    await app.command.handler('开', app.ctx);
+    await app.command.handler('on', app.ctx);
+    assert.ok(app.statuses.at(-1).endsWith(`图片压缩率 ${imageRate}`), '重新启用后状态栏应恢复显示图片压缩率');
     const again = await app.emit('context_with_system', { messages });
     assert.equal(again.messages[0].content[1].mimeType, 'image/webp');
     const next = payloadFor(again.messages);
@@ -160,11 +175,11 @@ test('统一开关、补全、图片优化和实际请求统计在同一扩展�
     await globalThis.fetch(endpoint, { method: 'POST', body: JSON.stringify(next) });
     await app.emit('agent_settled');
     assert.equal(JSON.parse(await readFile(join(report, 'summary.json'), 'utf8')).request_count, 4);
-    await app.command.handler('统计', app.ctx);
+    await app.command.handler('stats', app.ctx);
     assert.match(app.notices.at(-1)[0], /累计上传/);
-    await app.command.handler('清理缓存', app.ctx);
+    await app.command.handler('clear-cache', app.ctx);
     assert.equal(app.notices.at(-1)[0], '图片缓存已清理');
-    await app.command.handler('关', app.ctx);
+    await app.command.handler('off', app.ctx);
     await app.emit('session_shutdown');
     assert.equal(globalThis.fetch, originalFetch);
     assert.equal(app.statuses.at(-1), undefined);
@@ -172,9 +187,9 @@ test('统一开关、补全、图片优化和实际请求统计在同一扩展�
 
     const restarted = await harness();
     await restarted.emit('session_start');
-    assert.equal(globalThis.fetch, originalFetch);
-    assert.match(restarted.statuses.at(-1), /^累计上传 0.000 MiB \| 当前 0.000 MiB \| 图片压缩率 0.0%$/);
+    assert.match(restarted.statuses.at(-1), /^累计上传 0.000 MiB \| 当前 0.000 MiB$/);
     await restarted.emit('session_shutdown');
+    assert.equal(globalThis.fetch, originalFetch);
   } finally {
     globalThis.fetch = priorFetch;
     for (const [key, value] of Object.entries(previousEnv)) {
@@ -195,7 +210,7 @@ test('未指定路径时配置写入 Pi 配置目录，包目录保持只读', a
   process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
   try {
     const app = await harness();
-    await app.command.handler('关', app.ctx);
+    await app.command.handler('off', app.ctx);
     const config = JSON.parse(await readFile(join(dir, 'agent', 'traffic-optimization', 'config.json'), 'utf8'));
     assert.equal(config.enabled, false);
     assert.equal(existsSync(new URL('../src/config.json', import.meta.url)), false);
@@ -285,7 +300,7 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     const agyOut = await app.emit('context_with_system', { messages: agyToolsMessages });
     assert.equal(agyOut.messages[2].content[0].text.length, 8000, 'context_recall 未激活时不应投影');
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 50, cacheRead: 200, cacheWrite: 0 } } });
-    await app.command.handler('上下文', app.ctx);
+    await app.command.handler('context', app.ctx);
     assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.skipped, 'recall_inactive');
 
     await app.emit('agent_settled');
@@ -315,19 +330,19 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     await app.emit('context_with_system', { messages: gcMessages });
     // 热轮次无 before_provider_request，后端仍上报未瘦身的 60000 tokens
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
-    await app.command.handler('上下文', app.ctx);
+    await app.command.handler('context', app.ctx);
     assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1, '热轮次中途 GC 不应被未瘦身后端 usage 拉高校准系数');
     // 紧接着同一热轮次的下一步也应保持不污染
     await app.emit('context_with_system', { messages: gcMessages });
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
-    await app.command.handler('上下文', app.ctx);
+    await app.command.handler('context', app.ctx);
     assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1);
     // 紧接着复用同一旧 sessionId（且显式返回 x-acp-projection-synced=0）时，继续跳过失真校准
     await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '复用旧会话' }] });
     app.emit('before_provider_request', { payload: { sessionId: 'agy-1', prompt: [{ type: 'text', text: '复用旧会话' }] } });
     app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-1', 'x-acp-projection-synced': '0' } });
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 50000, cacheWrite: 0 } } });
-    await app.command.handler('上下文', app.ctx);
+    await app.command.handler('context', app.ctx);
     assert.equal(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor, 1, '复用未瘦身旧会话时不得清零脱节保护');
 
     // 下一新用户轮次切换新 sessionId 并返回 x-acp-projection-synced=1 后，恢复正常动态校准
@@ -336,7 +351,7 @@ test('antigravity-acp 适配：直接载荷观测、宿主 MCP 工具结果回�
     app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-2', 'x-acp-projection-synced': '1' } });
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'stop', usage: { input: 10000, cacheRead: 35000, cacheWrite: 0 } } });
     await app.emit('context_with_system', { messages: [...gcMessages, { role: 'user', content: '确认校准' }] });
-    await app.command.handler('上下文', app.ctx);
+    await app.command.handler('context', app.ctx);
     assert.ok(JSON.parse(app.notices.at(-1)[0]).lastProjection.calibrationFactor > 1.2, '同步重建后应恢复正常动态校准');
 
     // 工具边界 steer 切入：经 after_provider_response(x-acp-transport=acp-mcp-result) 记账工具回传，随后再记账 steer session/prompt
@@ -649,6 +664,275 @@ test('antigravity-acp 上游全量快照（acp-upstream）替换本地增量、�
     assert.equal(summary.repeated_occurrences, 1);
     await app.emit('session_shutdown');
   } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('英文命令补全、二级模型补全、TUI 通知与跨事件状态栏刷新', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-cmd-tui-'));
+  const keys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR', 'PI_TRAFFIC_OPT_ARCHIVE_DIR'];
+  const previousEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const priorFetch = globalThis.fetch;
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = join(dir, 'config.json');
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = join(dir, 'report');
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  try {
+    const modelA = { baseUrl: 'https://example.test/v1', provider: 'openai', id: 'gpt-5', api: 'openai-responses' };
+    const modelB = { baseUrl: 'https://example.test/v1', provider: 'custom.cmd', id: 'deepseek/deepseek-v4', api: 'openai-completions' };
+    const app = await harness({
+      model: modelA,
+      modelRegistry: { getAvailable: () => [modelA, modelB], getAll: () => [modelA, modelB] },
+    });
+    // 所有一级补全均为英文子命令，不包含中文子命令
+    const top = app.command.getArgumentCompletions('');
+    assert.ok(top.length >= 10);
+    for (const item of top) assert.match(item.value, /^[a-z-]+$/);
+    assert.equal(app.command.getArgumentCompletions('开'), null);
+    assert.equal(app.command.getArgumentCompletions('关'), null);
+    assert.equal(app.command.getArgumentCompletions('统计'), null);
+
+    await app.emit('session_start');
+    assert.ok(app.statuses.length >= 1, 'session_start 应立即刷新状态栏');
+    assert.match(app.statuses.at(-1), /^累计上传 0\.000 MiB \| 当前 0\.000 MiB \| 图片压缩率 0\.0%$/);
+
+    // 二级与三级补全保留完整参数前缀
+    const modelSub = app.command.getArgumentCompletions('model o');
+    assert.deepEqual(modelSub.map(i => i.value), ['model on', 'model off']);
+    const modelTargets = app.command.getArgumentCompletions('model off deepseek');
+    assert.deepEqual(modelTargets.map(i => i.value), ['model off custom.cmd/deepseek/deepseek-v4']);
+
+    // /traffic-opt status 必须产出 TUI 通知并刷新状态栏
+    const beforeNotices = app.notices.length;
+    await app.command.handler('status', app.ctx);
+    assert.equal(app.notices.length, beforeNotices + 1);
+    assert.match(app.notices.at(-1)[0], /全局优化：开启/);
+    assert.match(app.notices.at(-1)[0], /openai\/gpt-5/);
+
+    // 旧中文命令返回英文用法警告
+    await app.command.handler('开', app.ctx);
+    assert.equal(app.notices.at(-1)[1], 'warning');
+    assert.match(app.notices.at(-1)[0], /\/traffic-opt \[on \| off/);
+
+    // after_provider_response 在 resetTransientState 后（无 lastDirectMeta）仍能借 activeCtx 更新状态栏
+    await app.emit('session_compact', { reason: 'manual' });
+    const countBefore = app.statuses.length;
+    const snap = {
+      total_payload_bytes: 20480, json_payload_bytes: 20480,
+      system_bytes: 2048, user_text_bytes: 18432, assistant_text_bytes: 0,
+      tool_call_bytes: 0, tool_result_bytes: 0, image_payload_bytes: 0, image_decoded_bytes: 0,
+      tool_schema_bytes: 0, opaque_reasoning_bytes: 0, other_bytes: 0,
+      text_content_utf8_bytes: 20000, image_count: 0, images: [], results: [],
+    };
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: {
+        'x-acp-transport': 'acp-upstream',
+        'x-acp-upstream-gen-count': '1',
+        'x-acp-upstream-snapshot': JSON.stringify(snap),
+      },
+    });
+    assert.ok(app.statuses.length > countBefore, '无 lastDirectMeta 时仍应通过 activeCtx 更新状态栏');
+    assert.ok(app.statuses.at(-1).includes(`当前 ${asMiB(20480)}`));
+    await app.emit('session_shutdown');
+  } finally {
+    globalThis.fetch = priorFetch;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('模型级启用：默认全开、单模型关闭仅统计流量隐藏压缩率、切换模型即时同步（含斜杠模型 ID 与 ACP）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-model-toggle-'));
+  const keys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR', 'PI_TRAFFIC_OPT_ARCHIVE_DIR'];
+  const previousEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const priorFetch = globalThis.fetch;
+  const configPath = join(dir, 'config.json');
+  const reportDir = join(dir, 'report');
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = configPath;
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = reportDir;
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  await writeFile(configPath, JSON.stringify({ enabled: true, skipBelowKB: 0, cache: { enabled: false }, logging: 'off' }));
+  globalThis.fetch = async () => new Response('{}', { status: 200 });
+  try {
+    const modelHttpA = { baseUrl: 'https://example.test/v1', provider: 'custom.cmd', id: 'deepseek/deepseek-v4', api: 'openai-responses' };
+    const modelHttpB = { baseUrl: 'https://example.test/v1', provider: 'openai', id: 'gpt-5', api: 'openai-responses' };
+    const modelAcp = { baseUrl: 'acp://antigravity-cli', provider: 'antigravity', id: 'gemini-4-neon', api: 'antigravity-acp' };
+    const app = await harness({
+      model: modelHttpA,
+      modelRegistry: { getAvailable: () => [modelHttpA, modelHttpB, modelAcp], getAll: () => [modelHttpA, modelHttpB, modelAcp] },
+    });
+    await app.emit('session_start');
+    // 默认全部模型启用：显示图片压缩率、暴露 context_recall
+    assert.equal(app.tools.get('context_recall').exposure, 'direct');
+    assert.match(app.statuses.at(-1), /图片压缩率 0\.0%$/);
+
+    // 准备一张可压缩 PNG
+    const raw = Buffer.alloc(360 * 360 * 3);
+    let seed = 42;
+    for (let i = 0; i < raw.length; i++) { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; raw[i] = seed & 255; }
+    const pngB64 = (await sharp(raw, { raw: { width: 360, height: 360, channels: 3 } }).png().toBuffer()).toString('base64');
+    const messages = [{ role: 'user', content: [{ type: 'text', text: '看图' }, { type: 'image', mimeType: 'image/png', data: pngB64 }] }];
+
+    // 模型 A 启用时发一次请求，产生真实图片压缩率
+    const optOut = await app.emit('context_with_system', { messages });
+    assert.equal(optOut.messages[0].content[1].mimeType, 'image/webp');
+    const payloadA = payloadFor(optOut.messages);
+    const bodyA = JSON.stringify(payloadA);
+    app.emit('before_provider_request', { payload: payloadA });
+    await globalThis.fetch(endpoint, { method: 'POST', body: bodyA });
+    await app.emit('message_end', { message: { role: 'assistant', usage: { input: 10, cacheRead: 0, cacheWrite: 0 } } });
+    const rateA = app.statuses.at(-1).match(/图片压缩率 ([\d.]+%)/)?.[1];
+    assert.ok(rateA && rateA !== '0.0%', `启用模型应计算非零压缩率，实际: ${app.statuses.at(-1)}`);
+
+    // 关闭当前模型（含斜杠的模型 ID）
+    await app.command.handler('model off', app.ctx);
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(saved.models['custom.cmd/deepseek/deepseek-v4'], false);
+    assert.equal(app.tools.get('context_recall').exposure, 'hidden', '关闭当前模型后应隐藏 context_recall');
+    assert.equal(app.statuses.at(-1).includes('图片压缩率'), false, '关闭当前模型后状态栏不应显示图片压缩率');
+    assert.match(app.statuses.at(-1), /^累计上传 [\d.]+ MiB \| 当前 [\d.]+ MiB$/);
+
+    // 在已关闭的模型 A 上发带原图的请求：不压缩、不投影，但继续精确统计上传流量且不稀释图片压缩率
+    const passthrough = await app.emit('context_with_system', { messages });
+    assert.equal(passthrough, undefined, '关闭模型时 context_with_system 不应修改消息');
+    const rawPayload = payloadFor(messages);
+    const rawBody = JSON.stringify(rawPayload);
+    app.emit('before_provider_request', { payload: rawPayload });
+    await globalThis.fetch(endpoint, { method: 'POST', body: rawBody });
+    await app.emit('message_end', { message: { role: 'assistant', usage: { input: 20, cacheRead: 0, cacheWrite: 0 } } });
+    assert.equal(app.statuses.at(-1), `累计上传 ${asMiB(Buffer.byteLength(bodyA) + Buffer.byteLength(rawBody))} | 当前 ${asMiB(Buffer.byteLength(rawBody))}`);
+
+    // 切换到默认启用的模型 B：状态栏立刻恢复显示压缩率且压缩率未被模型 A 原图稀释
+    app.setModel(modelHttpB);
+    await app.emit('model_select', { model: modelHttpB, previousModel: modelHttpA, source: 'set' });
+    assert.equal(app.tools.get('context_recall').exposure, 'direct');
+    assert.ok(app.statuses.at(-1).endsWith(`图片压缩率 ${rateA}`), `切回启用模型应维持真实压缩率 ${rateA}，实际: ${app.statuses.at(-1)}`);
+
+    // 关闭 ACP 模型并切换过去：acp-upstream 仍统计流量、状态栏不显示压缩率
+    await app.command.handler('models disable antigravity/gemini-4-neon', app.ctx);
+    app.setModel(modelAcp);
+    await app.emit('model_select', { model: modelAcp, previousModel: modelHttpB, source: 'set' });
+    assert.equal(app.tools.get('context_recall').exposure, 'hidden');
+    assert.equal(app.statuses.at(-1).includes('图片压缩率'), false);
+    assert.equal(await app.emit('context_with_system', { messages }), undefined);
+    app.emit('before_provider_request', { payload: { sessionId: 'agy-dis-1', prompt: [{ type: 'text', text: '看图' }] } });
+    app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-dis-1', 'x-acp-upstream-pending': '1' } });
+    const acpSnap = {
+      total_payload_bytes: 50000, json_payload_bytes: 50000,
+      system_bytes: 1000, user_text_bytes: 49000, assistant_text_bytes: 0,
+      tool_call_bytes: 0, tool_result_bytes: 0, image_payload_bytes: 0, image_decoded_bytes: 0,
+      tool_schema_bytes: 0, opaque_reasoning_bytes: 0, other_bytes: 0,
+      text_content_utf8_bytes: 49000, image_count: 0, images: [], results: [],
+    };
+    app.emit('after_provider_response', {
+      status: 200,
+      headers: {
+        'x-acp-session-id': 'agy-dis-1',
+        'x-acp-transport': 'acp-upstream',
+        'x-acp-upstream-gen-count': '1',
+        'x-acp-upstream-snapshot': JSON.stringify(acpSnap),
+      },
+    });
+    assert.equal(app.statuses.at(-1).includes('图片压缩率'), false);
+    assert.ok(app.statuses.at(-1).includes(`当前 ${asMiB(50000)}`));
+
+    // 重新启用 ACP 模型并检查持久化配置清除禁用项
+    await app.command.handler('model on', app.ctx);
+    assert.equal(app.tools.get('context_recall').exposure, 'direct');
+    assert.ok(app.statuses.at(-1).endsWith(`图片压缩率 ${rateA}`));
+    const afterReenable = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal('antigravity/gemini-4-neon' in afterReenable.models, false);
+    assert.equal(afterReenable.models['custom.cmd/deepseek/deepseek-v4'], false);
+
+    await app.emit('agent_settled');
+    const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
+    assert.equal(summary.request_count, 3, '启用与禁用模型的流量均应计入报告');
+    await app.emit('session_shutdown');
+  } finally {
+    globalThis.fetch = priorFetch;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('模型级启用：交互式 TUI 选择器、models list/reset 命令与配置 models 归一化', async () => {
+  // 单元测试 configuration.mjs 归一化与模型匹配逻辑
+  const normalized = normalizeConfiguration({
+    enabled: true,
+    models: {
+      ' openai/gpt-5 ': false,
+      'antigravity/gemini-4-neon': true,
+      '': false,
+      'invalid/type': 'yes',
+    },
+  });
+  assert.deepEqual(normalized.models, { 'openai/gpt-5': false, 'antigravity/gemini-4-neon': true });
+  assert.equal(modelKey({ provider: 'custom.a', id: 'deepseek/v4' }), 'custom.a/deepseek/v4');
+  assert.equal(isModelAllowed(normalized, { provider: 'openai', id: 'gpt-5' }), false);
+  assert.equal(isModelAllowed(normalized, { provider: 'openai', id: 'gpt-5-mini' }), true);
+  assert.equal(isModelEnabled({ ...normalized, enabled: false }, { provider: 'openai', id: 'gpt-5-mini' }), false);
+
+  const dir = await mkdtemp(join(tmpdir(), 'pi-traffic-select-'));
+  const keys = ['PI_TRAFFIC_OPT_CONFIG_PATH', 'PI_TRAFFIC_OPT_CACHE_DIR', 'PI_TRAFFIC_OPT_REPORT_DIR', 'PI_TRAFFIC_OPT_ARCHIVE_DIR'];
+  const previousEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const priorFetch = globalThis.fetch;
+  const configPath = join(dir, 'config.json');
+  process.env.PI_TRAFFIC_OPT_CONFIG_PATH = configPath;
+  process.env.PI_TRAFFIC_OPT_CACHE_DIR = join(dir, 'cache');
+  process.env.PI_TRAFFIC_OPT_REPORT_DIR = join(dir, 'report');
+  process.env.PI_TRAFFIC_OPT_ARCHIVE_DIR = join(dir, 'archive');
+  try {
+    const m1 = { baseUrl: 'https://a.test/v1', provider: 'prov-a', id: 'shared-model', api: 'openai-responses' };
+    const m2 = { baseUrl: 'https://b.test/v1', provider: 'prov-b', id: 'shared-model', api: 'openai-responses' };
+    const selectCalls = [];
+    // 模拟用户在 /traffic-opt models 交互选择器中关闭 m1，然后按 Esc 退出
+    let pickStep = 0;
+    const app = await harness({
+      mode: 'tui',
+      model: m1,
+      modelRegistry: { getAvailable: () => [m1, m2], getAll: () => [m1, m2] },
+      select: async (title, options) => {
+        selectCalls.push({ title, options });
+        if (pickStep === 0) {
+          pickStep++;
+          return options.find((opt) => opt.includes('prov-a/shared-model'));
+        }
+        return undefined;
+      },
+    });
+    await app.emit('session_start');
+    await app.command.handler('models', app.ctx);
+    assert.equal(selectCalls.length, 2, '切换一个模型后应停留在选择器中，直到取消退出');
+    assert.ok(selectCalls[0].options.some((opt) => opt === '[已启用] prov-a/shared-model (当前)'));
+    assert.ok(selectCalls[1].options.some((opt) => opt === '[已关闭] prov-a/shared-model (当前)'));
+    assert.equal(app.statuses.at(-1).includes('图片压缩率'), false);
+
+    // 同名裸模型 ID 歧义保护
+    await app.command.handler('models disable shared-model', app.ctx);
+    assert.equal(app.notices.at(-1)[1], 'warning');
+    assert.match(app.notices.at(-1)[0], /多个同名模型/);
+
+    // models list & models reset all
+    await app.command.handler('models list', app.ctx);
+    assert.match(app.notices.at(-1)[0], /prov-a\/shared-model/);
+    await app.command.handler('models reset all', app.ctx);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).models, {});
+    assert.match(app.statuses.at(-1), /图片压缩率 0\.0%$/);
+    await app.emit('session_shutdown');
+  } finally {
+    globalThis.fetch = priorFetch;
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

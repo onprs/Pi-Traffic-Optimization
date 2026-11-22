@@ -86,6 +86,8 @@ HTTP/2 观测依赖 Node 的 `http2.client.stream` diagnostics channels；缺少
 
 配置文件不存在或字段缺失时使用 `src/configuration.mjs` 与 `src/optimizer.mjs` 中的默认值；`config.example.json` 列出全部字段，其中 `logging` 为 `off`，代码默认值为 `summary`。修改默认值时同步更新两处和本节表格。以下 KB/MB 容量按 1024 进制计算。
 
+顶层 `models` 字段为 `<provider>/<model>` 到布尔值的映射，默认 `{}`（全部模型默认启用）；某模型设为 `false` 时对该模型关闭图片压缩、上下文归档/投影并隐藏 `context_recall`，仅保留只读流量统计与报告。全局 `enabled: false` 时对全部模型生效，同样保留只读流量统计。
+
 图片参数保持原行为：低于 300 KiB 默认跳过，目标 375 KiB，最长边 1920，默认 quality 82、最低 60、最高 88，保留透明通道；收益不足 5% 使用原图。缓存默认 1024 MiB / 7 天，内存图片缓存为 64 MiB。图片处理或缓存失败时保留原图。原图指扩展收到的 image block，Pi 自身的图片预处理可能已经发生。归档保存原图和选定的优化版本，recall 优先复用已保存版本。
 
 `contextOptimization` 的配置：
@@ -146,17 +148,20 @@ HTTP/2 观测依赖 Node 的 `http2.client.stream` diagnostics channels；缺少
 
 ## 命令和开关
 
-- `/traffic-opt`、`开`、`关`：总开关，写回配置，重启后保持。
-- `/traffic-opt 状态`、`统计`：状态及累计指标；统计会刷新报告。
-- `/traffic-opt 上下文`：working state、归档、投影和 recall 指标。
+- `/traffic-opt`：交互 TUI 模式下打开设置菜单，非交互环境切换全局开关。
+- `/traffic-opt on` / `off`：全局开关，写回配置，重启后保持。
+- `/traffic-opt status`、`stats`：输出当前生效状态或累计指标并刷新状态栏；`stats` 会刷新报告。
+- `/traffic-opt models`、`models list`、`models on|off|enable|disable|toggle|reset <provider/model|all>`：交互选择或命令行管理各模型的启用状态。
+- `/traffic-opt model [on|off|toggle|status|reset] [provider/model]`：查看或管理当前模型（或指定模型）的启用状态，支持含 `/` 的模型 ID。
+- `/traffic-opt context`：working state、归档、投影和 recall 指标。
 - `/traffic-opt archive`：归档目录与使用情况。
 - `/traffic-opt recall <实际 ctx handle>`：查看对象 metadata。
 - `/traffic-opt gc`：执行一次维护；活跃 session 引用及 lease 受保护。
-- `/traffic-opt 清理缓存`：清理图片优化缓存，归档仍保留已保存的图片版本。
+- `/traffic-opt clear-cache`：清理图片优化缓存，归档仍保留已保存的图片版本。
 
-关闭后暂停压缩、投影、自动归档及新增请求观测，并隐藏 recall；请求恢复 Pi 提供的完整上下文。页脚保留本进程之前的计数。重新开启后从原会话恢复归档与稳定投影。关闭不能恢复已由 Pi 原生 compact 改变的当前窗口，完整历史仍保留在 Pi session 文件中。
+关闭全局优化或关闭某个模型后，停止对应请求的图片压缩、上下文投影与自动归档并隐藏 `context_recall`，请求保持 Pi 提供的完整上下文和原图；只读流量观测继续工作，不将未优化图片计入图片压缩率。重新启用后恢复归档与稳定投影。关闭不能恢复已由 Pi 原生 compact 改变的当前窗口，完整历史仍保留在 Pi session 文件中。
 
-左下状态行保留累计上传、最近请求大小和图片压缩率三个指标。非交互模式继续执行处理和记录。
+状态栏在当前模型启用优化时显示累计上传、当前请求大小和图片压缩率三个指标；当前模型关闭优化（或全局关闭）时仅显示累计上传与当前请求大小。在 `session_start`、`model_select`、`session_tree`、`session_compact`、`before_agent_start` 与每次请求记账后都会刷新状态栏。非交互模式继续执行处理和记录。
 
 ## context_recall
 

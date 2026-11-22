@@ -139,7 +139,7 @@ export async function runSession({ workspace, output, projection = true, compact
     if (errors.length) throw new Error(errors.join('\n'));
     let disabledCheck, reenabledCheck;
     if (verifyDisabled) {
-      await session.prompt('/traffic-opt 关');
+      await session.prompt('/traffic-opt off');
       const recallActive = session.getActiveToolNames().includes('context_recall');
       await session.prompt('继续确认完整上下文。');
       const payload = requests.at(-1).payload;
@@ -147,12 +147,12 @@ export async function runSession({ workspace, output, projection = true, compact
         projectedHandlesInToolResults: payload.input.some(x => x.type === 'function_call_output' && /\[已归档/.test(JSON.stringify(x.output))),
         imageBase64Bytes: payload.input.reduce((n, x) => n + (JSON.stringify(x).match(/data:image\/[^;]+;base64,([A-Za-z0-9+/=]+)/g) ?? [])
           .reduce((v, s) => v + s.slice(s.indexOf(',') + 1).length, 0), 0) };
-      await session.prompt('/traffic-opt 开');
+      await session.prompt('/traffic-opt on');
       await session.prompt('恢复上下文优化。');
       reenabledCheck = { recallActive: session.getActiveToolNames().includes('context_recall'),
         projectedHandlesInToolResults: requests.at(-1).payload.input.some(x => x.type === 'function_call_output' && /\[已归档/.test(JSON.stringify(x.output))) };
     }
-    await session.prompt('/traffic-opt 统计');
+    await session.prompt('/traffic-opt stats');
     const summary = JSON.parse(await readFile(join(report, 'summary.json'), 'utf8'));
     const canonical = manager.getBranch().filter(e => e.type === 'message').map(e => e.message);
     const file = manager.getSessionFile();

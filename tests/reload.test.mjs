@@ -33,7 +33,7 @@ test('Pi reload 刷新真实 ContextMemory 和它依赖的 ContextArchive，源�
     return result.extensions[0];
   };
   const stats = async extension => {
-    await extension.commands.get('traffic-opt').handler('上下文', ctx);
+    await extension.commands.get('traffic-opt').handler('context', ctx);
     return JSON.parse(notifications.at(-1));
   };
   const shutdown = async extension => {

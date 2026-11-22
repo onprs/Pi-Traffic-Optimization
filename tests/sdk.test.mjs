@@ -57,8 +57,8 @@ test('Pi 1.x SDK 长会话：真实工具、精确 recall、stale、image page-i
     assert.equal(r.reenabledCheck.recallActive, true);
     assert.equal(r.reenabledCheck.projectedHandlesInToolResults, true);
     assert.ok(r.archiveFilesAfterShutdown.every(n => !/-wal$|-shm$/.test(n)));
-    assert.equal(r.summary.request_count, r.requests.length - 1);
-    assert.equal(r.summary.total_upload_bytes, r.requests.filter((_, i) => i !== r.disabledCheck.requestIndex).reduce((n, x) => n + x.bytes, 0));
+    assert.equal(r.summary.request_count, r.requests.length);
+    assert.equal(r.summary.total_upload_bytes, r.requests.reduce((n, x) => n + x.bytes, 0));
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -144,7 +144,7 @@ test('Pi SDK (google-generative-ai)：多轮 35KB 工具输出保持请求前缀
       if (JSON.stringify(currPrefix) !== JSON.stringify(prev)) prefixBreaks++;
     }
     assert.ok(prefixBreaks <= 1, `13 轮连续 36KB 输出最多触发 1 次批量清扫，实际破坏 ${prefixBreaks} 次`);
-    await session.prompt('/traffic-opt 统计');
+    await session.prompt('/traffic-opt stats');
     const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
     assert.ok(summary.context_optimization.gcSweeps <= 1);
     assert.ok(summary.context_optimization.gcSkips >= 5);

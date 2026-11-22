@@ -4,7 +4,8 @@
 
 - **图片压缩**：发送前自动压缩较大的图片，原会话保留原图。
 - **上下文归档**：较早的大段工具输出和图片保存到本地，请求中以短引用代替，需要时由模型通过 `context_recall` 工具按需取回。
-- **流量统计**：状态栏显示累计上传量、最近一次请求大小和图片压缩率，并生成本地流量报告。
+- **模型级启用**：默认对全部模型启用优化，可按模型单独开启或关闭；已启用优化的模型在状态栏显示累计上传、当前请求大小和图片压缩率，已关闭优化的模型仅显示流量统计。
+- **流量统计**：状态栏显示实时上传流量指标，并生成本地流量报告。
 
 ## 系统要求
 
@@ -32,21 +33,25 @@ pi remove npm:pi-traffic-optimization
 
 ## 使用
 
-扩展安装后默认启用。在 Pi 中使用 `/traffic-opt` 命令：
+扩展安装后默认对全部模型启用。在 Pi 中使用 `/traffic-opt` 命令：
 
 | 命令 | 作用 |
 |---|---|
-| `/traffic-opt` | 切换开关 |
-| `/traffic-opt 开` / `关` | 开启或关闭全部优化，重启后保持 |
-| `/traffic-opt 状态` | 刷新状态栏 |
-| `/traffic-opt 统计` | 查看累计指标并写出报告 |
-| `/traffic-opt 上下文` | 查看归档与取回情况 |
+| `/traffic-opt` | 在交互界面打开设置菜单（非交互环境切换全局开关） |
+| `/traffic-opt on` / `off` | 开启或关闭全局优化，重启后保持 |
+| `/traffic-opt status` | 查看当前生效状态并刷新状态栏 |
+| `/traffic-opt stats` | 查看累计指标并写出报告 |
+| `/traffic-opt models` | 打开模型级启用选择器，逐个开启或关闭对应模型 |
+| `/traffic-opt models list` | 查看当前已配置的模型级启用状态 |
+| `/traffic-opt model on` / `off` / `toggle` `[provider/model]` | 启用、关闭或切换当前模型（或指定模型） |
+| `/traffic-opt model reset` `[provider/model\|all]` | 恢复指定模型或全部模型默认启用 |
+| `/traffic-opt context` | 查看归档与取回情况 |
 | `/traffic-opt archive` | 查看归档目录与占用 |
 | `/traffic-opt recall <ctx://...>` | 查看某个归档对象的信息 |
 | `/traffic-opt gc` | 立即清理过期归档 |
-| `/traffic-opt 清理缓存` | 清理图片压缩缓存 |
+| `/traffic-opt clear-cache` | 清理图片压缩缓存 |
 
-关闭后，请求恢复为 Pi 提供的完整上下文。
+关闭全局优化或关闭某个模型后，对应模型的请求保持 Pi 提供的完整上下文和原图，同时继续统计上传流量并在状态栏仅显示流量统计。
 
 ## 配置
 
@@ -63,6 +68,7 @@ pi remove npm:pi-traffic-optimization
 | 字段 | 默认值 | 作用 |
 |---|---:|---|
 | `enabled` | `true` | 总开关 |
+| `models` | `{}` | 模型级开关映射（键为 `<provider>/<model>`，值为 `true`/`false`，未列出的模型默认启用） |
 | `skipBelowKB` | `300` | 小于该大小的图片不压缩 |
 | `maxLongEdge` | `1920` | 压缩后图片的最长边 |
 | `targetKB` | `375` | 压缩目标大小 |

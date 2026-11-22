@@ -34,8 +34,45 @@ const number = (v, d, lo, hi, integer = true) => Number.isFinite(v) && v >= lo &
   (!integer || Number.isSafeInteger(v)) ? v : d;
 const boolean = (v, d) => typeof v === 'boolean' ? v : d;
 
+// 生成规范化模型键（provider/modelId），保留模型 ID 中自带的斜杠。
+export function modelKey(model) {
+  if (typeof model === 'string') {
+    const trimmed = model.trim();
+    return trimmed || undefined;
+  }
+  if (!model || typeof model !== 'object') return undefined;
+  const id = typeof model.id === 'string' ? model.id.trim() : '';
+  if (!id) return undefined;
+  const provider = typeof model.provider === 'string' ? model.provider.trim() : '';
+  return provider ? `${provider}/${id}` : id;
+}
+
+// 仅判断模型级开关（默认全部模型启用）。
+export function isModelAllowed(config, model) {
+  const map = object(config?.models);
+  const fullKey = modelKey(model);
+  if (fullKey && typeof map[fullKey] === 'boolean') return map[fullKey];
+  if (model && typeof model === 'object' && typeof model.id === 'string') {
+    const bareId = model.id.trim();
+    if (bareId && typeof map[bareId] === 'boolean') return map[bareId];
+  }
+  return true;
+}
+
+// 结合全局开关与模型级开关，判断当前模型是否启用优化功能。
+export function isModelEnabled(config, model) {
+  if (config?.enabled === false) return false;
+  return isModelAllowed(config, model);
+}
+
 export function normalizeConfiguration(raw = {}) {
   raw = object(raw);
+  const rawModels = object(raw.models);
+  const models = {};
+  for (const [key, value] of Object.entries(rawModels)) {
+    const normalizedKey = key.trim();
+    if (normalizedKey && typeof value === 'boolean') models[normalizedKey] = value;
+  }
   const input = object(raw.contextOptimization);
   const d = contextDefaults;
   const c = {};
@@ -85,5 +122,5 @@ export function normalizeConfiguration(raw = {}) {
   const reporting = {};
   for (const [k, lo, hi] of [['summaryIntervalSeconds', 1, 3600], ['retentionDays', 1, 365],
     ['maxSizeMB', 1, 10240], ['maxRunMB', 1, 1024], ['recentRecords', 10, 1000]]) reporting[k] = number(report[k], reportDefaults[k], lo, hi);
-  return { ...normalizeImages(raw), contextOptimization: c, reporting };
+  return { ...normalizeImages(raw), models, contextOptimization: c, reporting };
 }

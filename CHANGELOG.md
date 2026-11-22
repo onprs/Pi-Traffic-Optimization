@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 新增模型级启用配置（`models`）及 `/traffic-opt model`、`/traffic-opt models` 命令与交互式选择器，支持按 `<provider>/<model>` 单独开启或关闭优化（默认全部模型启用）。
+
+### 改进
+
+- 将 `/traffic-opt` 全部子命令与自动补全统一改为英文（`on`、`off`、`status`、`stats`、`model`、`models`、`context`、`archive`、`recall`、`gc`、`clear-cache`），并支持多级参数补全与交互主菜单。
+- 状态栏按当前模型生效状态展示：启用优化时显示累计上传、当前请求大小与图片压缩率，关闭优化时仅显示累计上传与当前请求大小，并在关闭优化时继续统计上传流量。
+
+### 修复
+
+- 修复扩展在 TUI 中状态栏延迟显示或跨事件丢失刷新，以及 `/traffic-opt status`、`on`、`off` 执行后缺少 TUI 状态通知的问题。
+
 ## [1.1.4] - 2026-11-22
 
 ### 改进
