@@ -14,6 +14,9 @@ node_modules/
 # 维护用的本地备份
 .maintenance-backup/
 
+# 本地代理与维护指引
+AGENTS.md
+
 # 本地环境变量文件
 .env
 .env.local
