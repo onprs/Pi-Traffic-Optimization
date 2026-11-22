@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-22
+
+### 修复
+
+- 修复通过虚拟模型路由器（如 `pi-virtual`）发起请求时流量统计始终为 `0` 的问题，支持自动匹配实际出站的物理模型（含 HTTP、WebSocket 与 `antigravity-acp`）并校准报告归属。
+- 修复通过 WebSocket 传输（如 `openai-codex-responses` 在默认 `auto` 传输模式下的全量与增量续传请求）时流量统计为 `0` 的问题。
+- 修复自定义 Anthropic 端点 `baseUrl` 已包含 `/v1` 前缀时可能漏记上传流量的问题。
+
 ## [1.2.0] - 2026-11-22
 
 ### 新增
