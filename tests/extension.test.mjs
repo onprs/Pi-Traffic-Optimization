@@ -581,7 +581,8 @@ test('antigravity-acp 上游全量快照（acp-upstream）替换本地增量、�
         'x-acp-session-id': 'agy-up-1',
         'x-acp-transport': 'acp-upstream',
         'x-acp-projection-synced': '1',
-        'x-acp-upstream-gen-count': '1',
+        // 旧桥接可能用代次数标记多次请求，却只带最后一条快照。
+        'x-acp-upstream-gen-count': '3',
         'x-acp-upstream-snapshot': JSON.stringify(snap1),
       },
     });
@@ -599,7 +600,7 @@ test('antigravity-acp 上游全量快照（acp-upstream）替换本地增量、�
     app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-transport': 'acp-upstream-reused', 'x-acp-projection-synced': '1' } });
     await app.emit('message_end', { message: { role: 'assistant', provider: 'antigravity', model: 'gemini-4-neon', stopReason: 'toolUse', usage: { input: 100, cacheRead: 900, cacheWrite: 0 } } });
 
-    // 轮次 3：工具边界切入（先收到 x-acp-mcp-cutin=1 + x-acp-upstream-pending=1 跳过本地占位，再收到抢跑取消的 detached 499，再收到真实全量 1.05MiB 且仍含已缓存优化图）
+    // 轮次 3：先暂存切入前的 MCP 回传，再记录抢跑取消的代次，最后用切入后的快照替换本地载荷。
     await app.emit('context_with_system', { messages: [...msg2, { role: 'user', content: '切入继续' }] });
     app.emit('after_provider_response', { status: 200, headers: { 'x-acp-session-id': 'agy-up-1', 'x-acp-transport': 'acp-mcp-result', 'x-acp-settled-mcp-ids': 'agy_mcp_seq_1', 'x-acp-mcp-cutin': '1', 'x-acp-upstream-pending': '1' } });
     const detachedSnap = {
@@ -662,6 +663,9 @@ test('antigravity-acp 上游全量快照（acp-upstream）替换本地增量、�
     assert.equal(summary.unique_images, 1);
     assert.equal(summary.image_occurrences, 2);
     assert.equal(summary.repeated_occurrences, 1);
+    assert.equal(summary.acp_local_payload_bytes, summary.requests[3].total_payload_bytes);
+    assert.equal(summary.observed_upload_bytes, snap1.total_payload_bytes + detachedSnap.total_payload_bytes + snap3.total_payload_bytes);
+    assert.match(app.statuses.at(-1), /当前 ACP 本地 .* | ACP 本地累计/);
     await app.emit('session_shutdown');
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {
