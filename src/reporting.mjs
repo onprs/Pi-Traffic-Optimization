@@ -23,6 +23,7 @@ export class TrafficReporter {
     this.records = []; this.count = 0; this.sums = Object.fromEntries(sumKeys.map(k => [k, 0]));
     this.toolTotals = new Map(); this.imageHashes = new Set(); this.imageOccurrences = 0;
     this.repeatedBytes = 0; this.repeatedOccurrences = 0; this.maximum = 0;
+    this.acpLocalPayloadBytes = 0;
     this.histogram = new Map(); this.largest = []; this.queue = Promise.resolve(); this.pendingBytes = 0;
     this.writtenBytes = 0; this.droppedEvents = 0; this.failures = 0; this.dirty = false;
   }
@@ -49,6 +50,9 @@ export class TrafficReporter {
     this.records.push(record);
     if (this.records.length > this.config.recentRecords) this.records.shift();
     for (const key of sumKeys) this.sums[key] += record[key] ?? (key === 'json_payload_bytes' ? record.total_payload_bytes : 0);
+    if (record.transport === 'acp-stdio' || record.transport === 'acp-mcp-result') {
+      this.acpLocalPayloadBytes += record.total_payload_bytes;
+    }
     this.maximum = Math.max(this.maximum, record.total_payload_bytes);
     const bucket = Math.floor(Math.log2(Math.max(1, record.total_payload_bytes)) * 16);
     this.histogram.set(bucket, (this.histogram.get(bucket) ?? 0) + 1);
@@ -85,7 +89,9 @@ export class TrafficReporter {
   }
   summary() {
     const s = this.sums; const total = s.total_payload_bytes;
-    return { request_count: this.count, total_upload_bytes: total, average_bytes: this.count ? total / this.count : 0,
+    return { request_count: this.count, total_upload_bytes: total,
+      observed_upload_bytes: total - this.acpLocalPayloadBytes, acp_local_payload_bytes: this.acpLocalPayloadBytes,
+      average_bytes: this.count ? total / this.count : 0,
       p50_bytes: this.percentile(.5), p95_bytes: this.percentile(.95), percentile_measurement: 'estimated_log_histogram',
       maximum_bytes: this.maximum, candidate_payload_bytes: s.candidate_payload_bytes,
       json_payload_bytes: s.json_payload_bytes,
@@ -119,19 +125,19 @@ export class TrafficReporter {
       const s = this.summary();
       await this.atomic('summary.json', JSON.stringify(s, null, 2) + '\n');
       const lines = ['# Pi 流量与 Context Projection 观测', '',
-        '最终请求体大小为 measured，HTTP 覆盖 fetch、Node HTTP/1 与 HTTP/2（含重试及内容压缩），WebSocket 覆盖实际发送帧正文，ACP 优先统计 antigravity-acp 从本地会话快照还原的上游全量请求（acp-upstream），不可用时回退统计 session/prompt 与宿主 MCP 工具结果回传。响应/TCP/TLS 字节未采集。',
+        'HTTP 统计 fetch、Node HTTP/1 和 HTTP/2 实际发送的正文，WebSocket 覆盖实际发送帧正文。ACP 上游请求（acp-upstream）的体积由会话快照还原。快照不可用时单列本地 ACP prompt 与 MCP 回传载荷体积。响应和 TCP/TLS 字节不计入报告。',
         '内容分类及图片占比按解压后的 JSON UTF-8 字节计算；json_payload_bytes 与压缩后的 total_payload_bytes 分别记录。',
         'events.jsonl 是增量事实记录；requests.csv 的 request/update 行按 request_id 合并，update 不算新请求。摘要明细仅保留最近配置数量。',
         'tool 投影量是 context 文本 UTF-8 差；图片避免量是优化图片二进制的 counterfactual。未优化 HTTP 请求体不存在时，HTTP 节省值为 null。tokens 和 compact 压力指标为 estimated。', '',
-        `请求 ${s.request_count}；累计 ${mib(s.total_upload_bytes)} MiB；均值 ${mib(s.average_bytes)} MiB；最大 ${mib(s.maximum_bytes)} MiB。`, '',
+        `请求 ${s.request_count} 条，已观测上传 ${mib(s.observed_upload_bytes)} MiB，本地 ACP ${mib(s.acp_local_payload_bytes)} MiB。`, '',
         '| 类别 | MiB | 占比 |', '|---|---:|---:|',
         ...[['System', s.system_bytes], ['User', s.user_text_bytes], ['Assistant', s.assistant_text_bytes],
           ['Tool arguments', s.tool_call_bytes], ['Tool results', s.tool_result_text_bytes], ['Image Base64', s.images_bytes],
           ['Tool schemas', s.tool_schema_bytes], ['Other / JSON', s.other_bytes]].map(([k, v]) => `| ${k} | ${mib(v)} | ${percent(v, s.json_payload_bytes)} |`), '',
         `图片唯一 ${s.unique_images}，出现 ${s.image_occurrences}，重复 ${s.repeated_occurrences}。`, '',
         '## Context 指标', '', '```json', JSON.stringify(s.context_optimization, null, 2), '```', '',
-        '## 最近请求', '', '| 请求 | HTTP bytes | 输入 tokens | 工具投影 bytes | 图片投影数 |', '|---|---:|---:|---:|---:|',
-        ...s.requests.map(r => `| ${r.request_id} | ${r.total_payload_bytes} | ${r.context_tokens ?? '未知'} | ${r.tool_bytes_projected ?? 0} | ${r.image_blocks_projected ?? 0} |`), ''];
+        '## 最近请求', '', '| 请求 | 传输 | 载荷字节 | 输入 tokens | 工具投影字节 | 图片投影数 |', '|---|---|---:|---:|---:|---:|',
+        ...s.requests.map(r => `| ${r.request_id} | ${r.transport} | ${r.total_payload_bytes} | ${r.context_tokens ?? '未知'} | ${r.tool_bytes_projected ?? 0} | ${r.image_blocks_projected ?? 0} |`), ''];
       await this.atomic('report.md', lines.join('\n'));
     })().catch(() => { this.failures++; this.dirty = true; }).finally(() => { this.flushing = undefined; });
     return this.flushing;
